@@ -132,15 +132,18 @@ input int      InpCooldownSecondsAfterTrade = 60;      // Cooldown Seconds After
 input bool     InpAllowOppositeDirection = true;       // Allow Opposite Direction Positions
 
 //--- SIGNAL (Ported from original EA)
-input double   InpTimeBombUpPips        = 200.0;       // TimeBomb Up: Pips Threshold
+input double   InpTimeBombUpPips        = 50.0;        // TimeBomb Up: Pips Threshold
 input double   InpTimeBombUpSeconds     = 3.0;         // TimeBomb Up: Time Window (seconds)
-input double   InpTimeBombDownPips      = 200.0;       // TimeBomb Down: Pips Threshold
+input double   InpTimeBombDownPips      = 50.0;        // TimeBomb Down: Pips Threshold
 input double   InpTimeBombDownSeconds   = 3.0;         // TimeBomb Down: Time Window (seconds)
 input ENUM_SIGNAL_TYPE InpSignalType    = SIG_Continuous; // Signal Type
 input int      InpImpulseQuietBars      = 3;           // Impulse: Quiet Bars Count
-input double   InpImpulseQuietMinRange  = 5.0;         // Impulse: Quiet Bars Min Range (pips)
-input double   InpImpulseStrength       = 3.0;         // Impulse: Strength Multiplier
+input double   InpImpulseQuietMinRange  = 1.0;         // Impulse: Quiet Bars Min Range (pips)
+input double   InpImpulseStrength       = 1.5;         // Impulse: Strength Multiplier
 input int      InpImpulseShift          = 0;           // Impulse: Bar Shift
+input int      InpSignalConfirmWindowSec = 3;          // Signal: TB/Impulse confirm window (sec)
+input bool     InpAllowImpulseOnlyFallback = true;     // Signal: allow impulse-only fallback if no TB
+input int      InpImpulseOnlyFallbackBars = 20;        // Signal: bars without TB before fallback
 
 //--- ENTRY SYSTEM MASTER SWITCH
 input ENUM_ENTRY_SYSTEM InpEntrySystemMode = ENTRY_System1_SingleReversal; // Entry System Mode
@@ -272,6 +275,8 @@ double         g_tbUp_lastPrice = 0;
 datetime       g_tbUp_lastTime = 0;
 double         g_tbDn_lastPrice = 0;
 datetime       g_tbDn_lastTime = 0;
+datetime       g_tbUp_lastFireTime = 0;
+datetime       g_tbDn_lastFireTime = 0;
 
 // Impulse state
 double         g_impUp_QBrange = -1;
@@ -282,6 +287,15 @@ double         g_impDn_QBrange = -1;
 datetime       g_impDn_barTime = 0;
 datetime       g_impDn_barTime2 = 0;
 double         g_impDn_open = 0;
+datetime       g_impUp_lastFireTime = 0;
+datetime       g_impDn_lastFireTime = 0;
+
+// Signal diagnostics state
+datetime       g_signalUp_lastConfirmedAnchor = 0;
+datetime       g_signalDn_lastConfirmedAnchor = 0;
+datetime       g_lastSignalTime = 0;
+datetime       g_lastNoSignalDiagTime = 0;
+int            g_noSignalBars = 0;
 
 // Grid state
 datetime       g_gridActivationTime = 0;
@@ -317,6 +331,8 @@ bool ValidateInputs()
    if(InpTimeBombUpPips < 0 || InpTimeBombDownPips < 0) return false;
    if(InpTimeBombUpSeconds <= 0 || InpTimeBombDownSeconds <= 0) return false;
    if(InpImpulseQuietBars < 1 || InpImpulseStrength <= 0) return false;
+   if(InpSignalConfirmWindowSec < 0) return false;
+   if(InpImpulseOnlyFallbackBars < 1) return false;
 
    if(InpSys1_MaxPositions < 1 || InpSys1_MinSecBetween < 0) return false;
    if(InpGrid_MaxOrders < 1 || InpGrid_StepPips <= 0 || InpGrid_ActivationDelay < 0) return false;
@@ -612,6 +628,9 @@ bool DetectTimeBombUp()
       g_tbUp_lastTime  = timeNow;
    }
 
+   if(fired)
+      g_tbUp_lastFireTime = timeNow;
+
    return fired;
 }
 
@@ -644,6 +663,9 @@ bool DetectTimeBombDown()
       g_tbDn_lastPrice = priceNow;
       g_tbDn_lastTime  = timeNow;
    }
+
+   if(fired)
+      g_tbDn_lastFireTime = timeNow;
 
    return fired;
 }
@@ -687,6 +709,9 @@ bool DetectImpulseUp()
       }
    }
 
+   if(pass)
+      g_impUp_lastFireTime = TimeCurrent();
+
    return pass;
 }
 
@@ -729,22 +754,113 @@ bool DetectImpulseDown()
       }
    }
 
+   if(pass)
+      g_impDn_lastFireTime = TimeCurrent();
+
    return pass;
+}
+
+int BarsSinceTimestamp(datetime stamp)
+{
+   if(stamp <= 0)
+      return 2147483647;
+
+   int shift = iBarShift(g_symbol, g_timeframe, stamp, false);
+   if(shift < 0)
+      return 2147483647;
+
+   return shift;
+}
+
+void LogNoSignalDiagnostics()
+{
+   datetime now = TimeCurrent();
+   if(now - g_lastNoSignalDiagTime < 60)
+      return;
+
+   if(g_noSignalBars < 20)
+      return;
+
+   g_lastNoSignalDiagTime = now;
+
+   int barsSinceTbUp = BarsSinceTimestamp(g_tbUp_lastFireTime);
+   int barsSinceTbDn = BarsSinceTimestamp(g_tbDn_lastFireTime);
+   int barsSinceImpUp = BarsSinceTimestamp(g_impUp_lastFireTime);
+   int barsSinceImpDn = BarsSinceTimestamp(g_impDn_lastFireTime);
+
+   Print("Signal diagnostic: no entries for ", g_noSignalBars,
+         " bars. barsSinceTB(up/dn)=", barsSinceTbUp, "/", barsSinceTbDn,
+         " barsSinceIMP(up/dn)=", barsSinceImpUp, "/", barsSinceImpDn,
+         " confirmWindowSec=", InpSignalConfirmWindowSec,
+         " fallback=", (InpAllowImpulseOnlyFallback ? "ON" : "OFF"),
+         " fallbackBars=", InpImpulseOnlyFallbackBars);
 }
 
 // Combined signal: returns +1 for BUY, -1 for SELL, 0 for none
 int DetectSignal()
 {
-   bool tbUp = DetectTimeBombUp();
-   bool tbDn = DetectTimeBombDown();
-   bool impUp = false, impDn = false;
+   DetectTimeBombUp();
+   DetectTimeBombDown();
+   DetectImpulseUp();
+   DetectImpulseDown();
 
-   if(tbUp)  impUp = DetectImpulseUp();
-   if(tbDn)  impDn = DetectImpulseDown();
+   datetime now = TimeCurrent();
+   int signal = 0;
 
-   if(tbUp && impUp) return +1;
-   if(tbDn && impDn) return -1;
-   return 0;
+   if(g_tbUp_lastFireTime > 0 && g_impUp_lastFireTime > 0)
+   {
+      datetime upAnchor = (g_tbUp_lastFireTime > g_impUp_lastFireTime) ? g_tbUp_lastFireTime : g_impUp_lastFireTime;
+      int upGap = (int)MathAbs((int)(g_tbUp_lastFireTime - g_impUp_lastFireTime));
+      if(upGap <= InpSignalConfirmWindowSec
+         && (now - upAnchor) <= InpSignalConfirmWindowSec
+         && upAnchor > g_signalUp_lastConfirmedAnchor)
+      {
+         g_signalUp_lastConfirmedAnchor = upAnchor;
+         signal = +1;
+      }
+   }
+
+   if(signal == 0 && g_tbDn_lastFireTime > 0 && g_impDn_lastFireTime > 0)
+   {
+      datetime dnAnchor = (g_tbDn_lastFireTime > g_impDn_lastFireTime) ? g_tbDn_lastFireTime : g_impDn_lastFireTime;
+      int dnGap = (int)MathAbs((int)(g_tbDn_lastFireTime - g_impDn_lastFireTime));
+      if(dnGap <= InpSignalConfirmWindowSec
+         && (now - dnAnchor) <= InpSignalConfirmWindowSec
+         && dnAnchor > g_signalDn_lastConfirmedAnchor)
+      {
+         g_signalDn_lastConfirmedAnchor = dnAnchor;
+         signal = -1;
+      }
+   }
+
+   if(signal == 0 && InpAllowImpulseOnlyFallback)
+   {
+      int barsSinceTbUp = BarsSinceTimestamp(g_tbUp_lastFireTime);
+      int barsSinceTbDn = BarsSinceTimestamp(g_tbDn_lastFireTime);
+
+      if(g_impUp_lastFireTime > 0
+         && barsSinceTbUp >= InpImpulseOnlyFallbackBars
+         && g_impUp_lastFireTime > g_signalUp_lastConfirmedAnchor)
+      {
+         g_signalUp_lastConfirmedAnchor = g_impUp_lastFireTime;
+         signal = +1;
+      }
+      else if(g_impDn_lastFireTime > 0
+              && barsSinceTbDn >= InpImpulseOnlyFallbackBars
+              && g_impDn_lastFireTime > g_signalDn_lastConfirmedAnchor)
+      {
+         g_signalDn_lastConfirmedAnchor = g_impDn_lastFireTime;
+         signal = -1;
+      }
+   }
+
+   if(signal != 0)
+   {
+      g_lastSignalTime = now;
+      g_noSignalBars = 0;
+   }
+
+   return signal;
 }
 
 
@@ -1858,6 +1974,7 @@ void OnTick()
       ManageExits();
       return;
    }
+   bool isNewBar = (barTime != g_lastBarTime);
    g_lastBarTime = barTime;
 
    // Detect signal
@@ -1867,6 +1984,18 @@ void OnTick()
 
    // Run state machine
    RunStateMachine(signal);
+
+   // Diagnostics for long no-signal runs
+   if(isNewBar)
+   {
+      if(signal == 0)
+         g_noSignalBars++;
+      else
+         g_noSignalBars = 0;
+   }
+
+   if(signal == 0)
+      LogNoSignalDiagnostics();
 
    // Manage exits
    ManageExits();
