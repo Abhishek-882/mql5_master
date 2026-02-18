@@ -142,8 +142,21 @@ input double   InpImpulseQuietMinRange  = 1.0;         // Impulse: Quiet Bars Mi
 input double   InpImpulseStrength       = 1.5;         // Impulse: Strength Multiplier
 input int      InpImpulseShift          = 0;           // Impulse: Bar Shift
 input int      InpSignalConfirmWindowSec = 3;          // Signal: TB/Impulse confirm window (sec)
+input int      InpSignalConfirmWindowBars = 2;         // Signal: TB/Impulse confirm window (bars)
 input bool     InpAllowImpulseOnlyFallback = true;     // Signal: allow impulse-only fallback if no TB
 input int      InpImpulseOnlyFallbackBars = 20;        // Signal: bars without TB before fallback
+input bool     InpRequireTBHistoryBeforeFallback = true; // Signal: require TB history before fallback
+input bool     InpUseOriginalSignalProfile = false;    // Signal: use original-compatible profile defaults
+
+enum ENUM_SIGNAL_CONFLICT_POLICY
+{
+   CONFLICT_SkipBoth     = 0,
+   CONFLICT_MostRecent   = 1,
+   CONFLICT_PreferBuy    = 2,
+   CONFLICT_PreferSell   = 3
+};
+
+input ENUM_SIGNAL_CONFLICT_POLICY InpSignalConflictPolicy = CONFLICT_SkipBoth; // Signal conflict resolution
 
 //--- ENTRY SYSTEM MASTER SWITCH
 input ENUM_ENTRY_SYSTEM InpEntrySystemMode = ENTRY_System1_SingleReversal; // Entry System Mode
@@ -293,9 +306,42 @@ datetime       g_impDn_lastFireTime = 0;
 // Signal diagnostics state
 datetime       g_signalUp_lastConfirmedAnchor = 0;
 datetime       g_signalDn_lastConfirmedAnchor = 0;
+int            g_signalUp_lastConfirmedSeq = -1;
+int            g_signalDn_lastConfirmedSeq = -1;
 datetime       g_lastSignalTime = 0;
 datetime       g_lastNoSignalDiagTime = 0;
 int            g_noSignalBars = 0;
+
+// Signal event cache (updated once per tick)
+datetime       g_tbUp_lastFireBarTime = 0;
+datetime       g_tbDn_lastFireBarTime = 0;
+datetime       g_impUp_lastFireBarTime = 0;
+datetime       g_impDn_lastFireBarTime = 0;
+int            g_tbUp_lastFireBarIndex = -1;
+int            g_tbDn_lastFireBarIndex = -1;
+int            g_impUp_lastFireBarIndex = -1;
+int            g_impDn_lastFireBarIndex = -1;
+int            g_tbUp_lastFireSeq = 0;
+int            g_tbDn_lastFireSeq = 0;
+int            g_impUp_lastFireSeq = 0;
+int            g_impDn_lastFireSeq = 0;
+bool           g_tbHistoryKnownUp = false;
+bool           g_tbHistoryKnownDn = false;
+datetime       g_eaInitTime = 0;
+
+// Effective parameters (can be profile-adjusted)
+double         g_effTimeBombUpPips = 0.0;
+double         g_effTimeBombUpSeconds = 0.0;
+double         g_effTimeBombDownPips = 0.0;
+double         g_effTimeBombDownSeconds = 0.0;
+int            g_effImpulseQuietBars = 0;
+double         g_effImpulseStrength = 0.0;
+int            g_effSignalConfirmWindowSec = 0;
+int            g_effSignalConfirmWindowBars = 0;
+bool           g_effAllowImpulseOnlyFallback = false;
+int            g_effImpulseOnlyFallbackBars = 0;
+int            g_effCooldownSecondsAfterTrade = 0;
+int            g_effSys1MinSecBetween = 0;
 
 // Grid state
 datetime       g_gridActivationTime = 0;
@@ -332,6 +378,7 @@ bool ValidateInputs()
    if(InpTimeBombUpSeconds <= 0 || InpTimeBombDownSeconds <= 0) return false;
    if(InpImpulseQuietBars < 1 || InpImpulseStrength <= 0) return false;
    if(InpSignalConfirmWindowSec < 0) return false;
+   if(InpSignalConfirmWindowBars < 0) return false;
    if(InpImpulseOnlyFallbackBars < 1) return false;
 
    if(InpSys1_MaxPositions < 1 || InpSys1_MinSecBetween < 0) return false;
@@ -408,11 +455,54 @@ int OnInit()
    g_dailyResetTime = iTime(g_symbol, PERIOD_D1, 0);
    g_weeklyResetTime = iTime(g_symbol, PERIOD_W1, 0);
 
+   // Effective profile values
+   g_effTimeBombUpPips = InpTimeBombUpPips;
+   g_effTimeBombUpSeconds = InpTimeBombUpSeconds;
+   g_effTimeBombDownPips = InpTimeBombDownPips;
+   g_effTimeBombDownSeconds = InpTimeBombDownSeconds;
+   g_effImpulseQuietBars = InpImpulseQuietBars;
+   g_effImpulseStrength = InpImpulseStrength;
+   g_effSignalConfirmWindowSec = InpSignalConfirmWindowSec;
+   g_effSignalConfirmWindowBars = InpSignalConfirmWindowBars;
+   g_effAllowImpulseOnlyFallback = InpAllowImpulseOnlyFallback;
+   g_effImpulseOnlyFallbackBars = InpImpulseOnlyFallbackBars;
+   g_effCooldownSecondsAfterTrade = InpCooldownSecondsAfterTrade;
+   g_effSys1MinSecBetween = InpSys1_MinSecBetween;
+
+   if(InpUseOriginalSignalProfile)
+   {
+      g_effTimeBombUpPips = 30.0;
+      g_effTimeBombDownPips = 30.0;
+      g_effTimeBombUpSeconds = 5.0;
+      g_effTimeBombDownSeconds = 5.0;
+      g_effImpulseQuietBars = 2;
+      g_effImpulseStrength = 1.2;
+      g_effSignalConfirmWindowSec = 5;
+      g_effSignalConfirmWindowBars = 1;
+      g_effAllowImpulseOnlyFallback = false;
+      g_effImpulseOnlyFallbackBars = MathMax(5, InpImpulseOnlyFallbackBars);
+      g_effCooldownSecondsAfterTrade = MathMin(InpCooldownSecondsAfterTrade, 5);
+      g_effSys1MinSecBetween = MathMin(InpSys1_MinSecBetween, 1);
+   }
+
+   g_eaInitTime = iTime(g_symbol, g_timeframe, 0);
+
    Print("=== Master Trader V2.0 Initialized ===");
    Print("Symbol: ", g_symbol, " TF: ", EnumToString(g_timeframe));
    Print("Entry System: ", EnumToString(InpEntrySystemMode));
    Print("Exit System: ", EnumToString(InpExitSystemMode));
    Print("Pip Value Points: ", g_pipValue);
+   Print("Signal Profile: ", (InpUseOriginalSignalProfile ? "Original-Compatible" : "Advanced/Custom"));
+   Print("Effective Signal: TB(up/dn pips)=", g_effTimeBombUpPips, "/", g_effTimeBombDownPips,
+         " TB(up/dn sec)=", g_effTimeBombUpSeconds, "/", g_effTimeBombDownSeconds,
+         " impulseQuietBars=", g_effImpulseQuietBars,
+         " impulseStrength=", g_effImpulseStrength,
+         " confirmSec=", g_effSignalConfirmWindowSec,
+         " confirmBars=", g_effSignalConfirmWindowBars,
+         " fallback=", (g_effAllowImpulseOnlyFallback ? "ON" : "OFF"),
+         " fallbackBars=", g_effImpulseOnlyFallbackBars,
+         " cooldownSec=", g_effCooldownSecondsAfterTrade,
+         " minSecBetween=", g_effSys1MinSecBetween);
    Print("======================================");
 
    return INIT_SUCCEEDED;
@@ -609,14 +699,14 @@ bool DetectTimeBombUp()
       double pipsDiff = PriceToPips(priceNow - g_tbUp_lastPrice);
       int timeDiff    = (int)(timeNow - g_tbUp_lastTime);
 
-      if(pipsDiff >= InpTimeBombUpPips && timeDiff <= (int)InpTimeBombUpSeconds)
+      if(pipsDiff >= g_effTimeBombUpPips && timeDiff <= (int)g_effTimeBombUpSeconds)
       {
          if(priceNow > g_tbUp_lastPrice)
             fired = true;
          g_tbUp_lastPrice = priceNow;
          g_tbUp_lastTime  = timeNow;
       }
-      else if(timeDiff >= (int)InpTimeBombUpSeconds)
+      else if(timeDiff >= (int)g_effTimeBombUpSeconds)
       {
          g_tbUp_lastPrice = priceNow;
          g_tbUp_lastTime  = timeNow;
@@ -629,7 +719,13 @@ bool DetectTimeBombUp()
    }
 
    if(fired)
+   {
       g_tbUp_lastFireTime = timeNow;
+      g_tbUp_lastFireBarTime = iTime(g_symbol, g_timeframe, 0);
+      g_tbUp_lastFireBarIndex = iBarShift(g_symbol, g_timeframe, g_tbUp_lastFireBarTime, false);
+      g_tbUp_lastFireSeq++;
+      g_tbHistoryKnownUp = true;
+   }
 
    return fired;
 }
@@ -645,14 +741,14 @@ bool DetectTimeBombDown()
       double pipsDiff = PriceToPips(g_tbDn_lastPrice - priceNow);
       int timeDiff    = (int)(timeNow - g_tbDn_lastTime);
 
-      if(pipsDiff >= InpTimeBombDownPips && timeDiff <= (int)InpTimeBombDownSeconds)
+      if(pipsDiff >= g_effTimeBombDownPips && timeDiff <= (int)g_effTimeBombDownSeconds)
       {
          if(priceNow < g_tbDn_lastPrice)
             fired = true;
          g_tbDn_lastPrice = priceNow;
          g_tbDn_lastTime  = timeNow;
       }
-      else if(timeDiff >= (int)InpTimeBombDownSeconds)
+      else if(timeDiff >= (int)g_effTimeBombDownSeconds)
       {
          g_tbDn_lastPrice = priceNow;
          g_tbDn_lastTime  = timeNow;
@@ -665,7 +761,13 @@ bool DetectTimeBombDown()
    }
 
    if(fired)
+   {
       g_tbDn_lastFireTime = timeNow;
+      g_tbDn_lastFireBarTime = iTime(g_symbol, g_timeframe, 0);
+      g_tbDn_lastFireBarIndex = iBarShift(g_symbol, g_timeframe, g_tbDn_lastFireBarTime, false);
+      g_tbDn_lastFireSeq++;
+      g_tbHistoryKnownDn = true;
+   }
 
    return fired;
 }
@@ -682,7 +784,7 @@ bool DetectImpulseUp()
       g_impUp_barTime = barT;
       g_impUp_QBrange = 0;
 
-      for(int i = 0; i < InpImpulseQuietBars; i++)
+      for(int i = 0; i < g_effImpulseQuietBars; i++)
       {
          int shift = i + 1 + InpImpulseShift;
          double barRange = iHigh(g_symbol, g_timeframe, shift) - iLow(g_symbol, g_timeframe, shift);
@@ -701,7 +803,7 @@ bool DetectImpulseUp()
       && g_impUp_QBrange > minRange)
    {
       double impSize = iClose(g_symbol, g_timeframe, InpImpulseShift) - g_impUp_open;
-      if(impSize >= g_impUp_QBrange * InpImpulseStrength)
+      if(impSize >= g_impUp_QBrange * g_effImpulseStrength)
       {
          if(sigType != "continuous")
             g_impUp_barTime2 = barT;
@@ -710,7 +812,13 @@ bool DetectImpulseUp()
    }
 
    if(pass)
+   {
       g_impUp_lastFireTime = TimeCurrent();
+      int eventShift = (InpSignalType == SIG_OncePerBar) ? 1 : 0;
+      g_impUp_lastFireBarTime = iTime(g_symbol, g_timeframe, eventShift);
+      g_impUp_lastFireBarIndex = iBarShift(g_symbol, g_timeframe, g_impUp_lastFireBarTime, false);
+      g_impUp_lastFireSeq++;
+   }
 
    return pass;
 }
@@ -727,7 +835,7 @@ bool DetectImpulseDown()
       g_impDn_barTime = barT;
       g_impDn_QBrange = 0;
 
-      for(int i = 0; i < InpImpulseQuietBars; i++)
+      for(int i = 0; i < g_effImpulseQuietBars; i++)
       {
          int shift = i + 1 + InpImpulseShift;
          double barRange = iHigh(g_symbol, g_timeframe, shift) - iLow(g_symbol, g_timeframe, shift);
@@ -746,7 +854,7 @@ bool DetectImpulseDown()
       && g_impDn_QBrange > minRange)
    {
       double impSize = g_impDn_open - iClose(g_symbol, g_timeframe, InpImpulseShift);
-      if(impSize >= g_impDn_QBrange * InpImpulseStrength)
+      if(impSize >= g_impDn_QBrange * g_effImpulseStrength)
       {
          if(sigType != "continuous")
             g_impDn_barTime2 = barT;
@@ -755,24 +863,161 @@ bool DetectImpulseDown()
    }
 
    if(pass)
+   {
       g_impDn_lastFireTime = TimeCurrent();
+      int eventShift = (InpSignalType == SIG_OncePerBar) ? 1 : 0;
+      g_impDn_lastFireBarTime = iTime(g_symbol, g_timeframe, eventShift);
+      g_impDn_lastFireBarIndex = iBarShift(g_symbol, g_timeframe, g_impDn_lastFireBarTime, false);
+      g_impDn_lastFireSeq++;
+   }
 
    return pass;
+}
+
+void UpdateSignalEventState()
+{
+   DetectTimeBombUp();
+   DetectTimeBombDown();
+   DetectImpulseUp();
+   DetectImpulseDown();
 }
 
 int BarsSinceTimestamp(datetime stamp)
 {
    if(stamp <= 0)
-      return 2147483647;
+      return -1;
 
    int shift = iBarShift(g_symbol, g_timeframe, stamp, false);
    if(shift < 0)
-      return 2147483647;
+      return -1;
 
    return shift;
 }
 
-void LogNoSignalDiagnostics()
+int BarsSinceIndex(int barIndex)
+{
+   if(barIndex < 0)
+      return -1;
+   return barIndex;
+}
+
+bool IsBufferedMatch(datetime tbTime, datetime impTime,
+                     int tbBarIndex, int impBarIndex,
+                     datetime &anchorTime, int &anchorBarIndex,
+                     string &confirmPath)
+{
+   if(tbTime <= 0 || impTime <= 0)
+      return false;
+
+   anchorTime = (tbTime > impTime) ? tbTime : impTime;
+   anchorBarIndex = (tbTime >= impTime) ? tbBarIndex : impBarIndex;
+
+   int secGap = (int)MathAbs((int)(tbTime - impTime));
+   int anchorAgeSec = (int)MathAbs((int)(TimeCurrent() - anchorTime));
+   bool secOk = (secGap <= g_effSignalConfirmWindowSec && anchorAgeSec <= g_effSignalConfirmWindowSec);
+
+   int barGap = -1;
+   int anchorAgeBars = -1;
+   bool barsOk = false;
+   if(tbBarIndex >= 0 && impBarIndex >= 0 && anchorBarIndex >= 0)
+   {
+      barGap = MathAbs(tbBarIndex - impBarIndex);
+      anchorAgeBars = BarsSinceIndex(anchorBarIndex);
+      barsOk = (barGap <= g_effSignalConfirmWindowBars && anchorAgeBars <= g_effSignalConfirmWindowBars);
+   }
+
+   if(secOk)
+      confirmPath = "seconds";
+   else if(barsOk)
+      confirmPath = "bars";
+   else
+      confirmPath = "none";
+
+   return (secOk || barsOk);
+}
+
+bool ConfirmBufferedSignal(bool isBuy, bool consume, string sourceTag,
+                          datetime &anchorTimeOut, int &anchorSeqOut)
+{
+   datetime tbTime = isBuy ? g_tbUp_lastFireTime : g_tbDn_lastFireTime;
+   datetime impTime = isBuy ? g_impUp_lastFireTime : g_impDn_lastFireTime;
+   int tbBarIdx = isBuy ? g_tbUp_lastFireBarIndex : g_tbDn_lastFireBarIndex;
+   int impBarIdx = isBuy ? g_impUp_lastFireBarIndex : g_impDn_lastFireBarIndex;
+   int tbSeq = isBuy ? g_tbUp_lastFireSeq : g_tbDn_lastFireSeq;
+   int impSeq = isBuy ? g_impUp_lastFireSeq : g_impDn_lastFireSeq;
+
+   datetime anchorTime = 0;
+   int anchorBarIndex = -1;
+   string confirmPath = "none";
+   if(!IsBufferedMatch(tbTime, impTime, tbBarIdx, impBarIdx, anchorTime, anchorBarIndex, confirmPath))
+      return false;
+
+   int anchorSeq = (tbTime >= impTime) ? tbSeq : impSeq;
+   int lastSeq = isBuy ? g_signalUp_lastConfirmedSeq : g_signalDn_lastConfirmedSeq;
+   if(anchorSeq <= lastSeq)
+      return false;
+
+   anchorTimeOut = anchorTime;
+   anchorSeqOut = anchorSeq;
+
+   if(consume)
+   {
+      if(isBuy)
+      {
+         g_signalUp_lastConfirmedAnchor = anchorTime;
+         g_signalUp_lastConfirmedSeq = anchorSeq;
+      }
+      else
+      {
+         g_signalDn_lastConfirmedAnchor = anchorTime;
+         g_signalDn_lastConfirmedSeq = anchorSeq;
+      }
+   }
+
+   Print("Signal confirmed (", sourceTag, ") dir=", (isBuy ? "BUY" : "SELL"),
+         " path=", confirmPath,
+         " tbTime=", TimeToString(tbTime, TIME_SECONDS),
+         " impTime=", TimeToString(impTime, TIME_SECONDS),
+         " anchorBarIdx=", anchorBarIndex,
+         " anchorSeq=", anchorSeq,
+         " consume=", (consume ? "Y" : "N"));
+
+   return true;
+}
+
+bool ConfirmBuySignalBuffered(bool consume, string sourceTag, datetime &anchorTimeOut, int &anchorSeqOut)
+{
+   return ConfirmBufferedSignal(true, consume, sourceTag, anchorTimeOut, anchorSeqOut);
+}
+
+bool ConfirmSellSignalBuffered(bool consume, string sourceTag, datetime &anchorTimeOut, int &anchorSeqOut)
+{
+   return ConfirmBufferedSignal(false, consume, sourceTag, anchorTimeOut, anchorSeqOut);
+}
+
+bool IsImpulseFallbackEligible(bool isBuy, bool &tbHistoryKnown, bool &fallbackEligible)
+{
+   tbHistoryKnown = isBuy ? g_tbHistoryKnownUp : g_tbHistoryKnownDn;
+   int completedBarsSinceInit = BarsSinceTimestamp(g_eaInitTime);
+   bool startupReady = (completedBarsSinceInit >= g_effImpulseOnlyFallbackBars);
+
+   bool tbGapReady = false;
+   if(tbHistoryKnown)
+   {
+      datetime tbLast = isBuy ? g_tbUp_lastFireTime : g_tbDn_lastFireTime;
+      int barsSinceTb = BarsSinceTimestamp(tbLast);
+      tbGapReady = (barsSinceTb >= g_effImpulseOnlyFallbackBars);
+   }
+   else
+   {
+      tbGapReady = !InpRequireTBHistoryBeforeFallback;
+   }
+
+   fallbackEligible = startupReady && tbGapReady;
+   return fallbackEligible;
+}
+
+void LogNoSignalDiagnostics(bool isSignalEvaluationActive)
 {
    datetime now = TimeCurrent();
    if(now - g_lastNoSignalDiagTime < 60)
@@ -788,75 +1033,103 @@ void LogNoSignalDiagnostics()
    int barsSinceImpUp = BarsSinceTimestamp(g_impUp_lastFireTime);
    int barsSinceImpDn = BarsSinceTimestamp(g_impDn_lastFireTime);
 
+   bool fallbackEligibleUp = false, fallbackEligibleDn = false;
+   bool tbKnownUp = false, tbKnownDn = false;
+   IsImpulseFallbackEligible(true, tbKnownUp, fallbackEligibleUp);
+   IsImpulseFallbackEligible(false, tbKnownDn, fallbackEligibleDn);
+
    Print("Signal diagnostic: no entries for ", g_noSignalBars,
-         " bars. barsSinceTB(up/dn)=", barsSinceTbUp, "/", barsSinceTbDn,
+         " bars. state=", EnumToString(g_state),
+         " evalActive=", (isSignalEvaluationActive ? "Y" : "N"),
+         " barsSinceTB(up/dn)=", barsSinceTbUp, "/", barsSinceTbDn,
          " barsSinceIMP(up/dn)=", barsSinceImpUp, "/", barsSinceImpDn,
-         " confirmWindowSec=", InpSignalConfirmWindowSec,
-         " fallback=", (InpAllowImpulseOnlyFallback ? "ON" : "OFF"),
-         " fallbackBars=", InpImpulseOnlyFallbackBars);
+         " confirmSec=", g_effSignalConfirmWindowSec,
+         " confirmBars=", g_effSignalConfirmWindowBars,
+         " tbHistoryKnown(up/dn)=", (tbKnownUp ? "Y" : "N"), "/", (tbKnownDn ? "Y" : "N"),
+         " fallbackEligible(up/dn)=", (fallbackEligibleUp ? "Y" : "N"), "/", (fallbackEligibleDn ? "Y" : "N"));
 }
 
-// Combined signal: returns +1 for BUY, -1 for SELL, 0 for none
 int DetectSignal()
 {
-   DetectTimeBombUp();
-   DetectTimeBombDown();
-   DetectImpulseUp();
-   DetectImpulseDown();
-
-   datetime now = TimeCurrent();
    int signal = 0;
 
-   if(g_tbUp_lastFireTime > 0 && g_impUp_lastFireTime > 0)
+   datetime buyAnchor = 0, sellAnchor = 0;
+   int buySeq = -1, sellSeq = -1;
+
+   bool buyConfirmed = ConfirmBuySignalBuffered(false, "entry tb+imp buffered", buyAnchor, buySeq);
+   bool sellConfirmed = ConfirmSellSignalBuffered(false, "entry tb+imp buffered", sellAnchor, sellSeq);
+
+   if(!buyConfirmed && g_effAllowImpulseOnlyFallback)
    {
-      datetime upAnchor = (g_tbUp_lastFireTime > g_impUp_lastFireTime) ? g_tbUp_lastFireTime : g_impUp_lastFireTime;
-      int upGap = (int)MathAbs((int)(g_tbUp_lastFireTime - g_impUp_lastFireTime));
-      if(upGap <= InpSignalConfirmWindowSec
-         && (now - upAnchor) <= InpSignalConfirmWindowSec
-         && upAnchor > g_signalUp_lastConfirmedAnchor)
+      bool tbHistoryKnown = false;
+      bool fallbackEligible = false;
+      if(IsImpulseFallbackEligible(true, tbHistoryKnown, fallbackEligible)
+         && g_impUp_lastFireSeq > g_signalUp_lastConfirmedSeq)
       {
-         g_signalUp_lastConfirmedAnchor = upAnchor;
-         signal = +1;
+         buyConfirmed = true;
+         buyAnchor = g_impUp_lastFireTime;
+         buySeq = g_impUp_lastFireSeq;
+         Print("Signal confirmed (entry fallback) dir=BUY tbHistoryKnown=", (tbHistoryKnown ? "Y" : "N"),
+               " fallbackEligible=", (fallbackEligible ? "Y" : "N"));
       }
    }
 
-   if(signal == 0 && g_tbDn_lastFireTime > 0 && g_impDn_lastFireTime > 0)
+   if(!sellConfirmed && g_effAllowImpulseOnlyFallback)
    {
-      datetime dnAnchor = (g_tbDn_lastFireTime > g_impDn_lastFireTime) ? g_tbDn_lastFireTime : g_impDn_lastFireTime;
-      int dnGap = (int)MathAbs((int)(g_tbDn_lastFireTime - g_impDn_lastFireTime));
-      if(dnGap <= InpSignalConfirmWindowSec
-         && (now - dnAnchor) <= InpSignalConfirmWindowSec
-         && dnAnchor > g_signalDn_lastConfirmedAnchor)
+      bool tbHistoryKnown = false;
+      bool fallbackEligible = false;
+      if(IsImpulseFallbackEligible(false, tbHistoryKnown, fallbackEligible)
+         && g_impDn_lastFireSeq > g_signalDn_lastConfirmedSeq)
       {
-         g_signalDn_lastConfirmedAnchor = dnAnchor;
-         signal = -1;
+         sellConfirmed = true;
+         sellAnchor = g_impDn_lastFireTime;
+         sellSeq = g_impDn_lastFireSeq;
+         Print("Signal confirmed (entry fallback) dir=SELL tbHistoryKnown=", (tbHistoryKnown ? "Y" : "N"),
+               " fallbackEligible=", (fallbackEligible ? "Y" : "N"));
       }
    }
 
-   if(signal == 0 && InpAllowImpulseOnlyFallback)
+   if(buyConfirmed && sellConfirmed)
    {
-      int barsSinceTbUp = BarsSinceTimestamp(g_tbUp_lastFireTime);
-      int barsSinceTbDn = BarsSinceTimestamp(g_tbDn_lastFireTime);
+      if(InpSignalConflictPolicy == CONFLICT_SkipBoth)
+      {
+         Print("Signal conflict: BUY and SELL confirmed. Policy=SkipBoth buyAnchor=", TimeToString(buyAnchor, TIME_SECONDS),
+               " sellAnchor=", TimeToString(sellAnchor, TIME_SECONDS));
+         return 0;
+      }
+      if(InpSignalConflictPolicy == CONFLICT_PreferBuy)
+         sellConfirmed = false;
+      else if(InpSignalConflictPolicy == CONFLICT_PreferSell)
+         buyConfirmed = false;
+      else
+      {
+         if(buySeq >= sellSeq)
+            sellConfirmed = false;
+         else
+            buyConfirmed = false;
+      }
 
-      if(g_impUp_lastFireTime > 0
-         && barsSinceTbUp >= InpImpulseOnlyFallbackBars
-         && g_impUp_lastFireTime > g_signalUp_lastConfirmedAnchor)
-      {
-         g_signalUp_lastConfirmedAnchor = g_impUp_lastFireTime;
-         signal = +1;
-      }
-      else if(g_impDn_lastFireTime > 0
-              && barsSinceTbDn >= InpImpulseOnlyFallbackBars
-              && g_impDn_lastFireTime > g_signalDn_lastConfirmedAnchor)
-      {
-         g_signalDn_lastConfirmedAnchor = g_impDn_lastFireTime;
-         signal = -1;
-      }
+      Print("Signal conflict resolved. Policy=", EnumToString(InpSignalConflictPolicy),
+            " chosen=", (buyConfirmed ? "BUY" : "SELL"),
+            " buySeq=", buySeq, " sellSeq=", sellSeq);
+   }
+
+   if(buyConfirmed)
+   {
+      g_signalUp_lastConfirmedAnchor = buyAnchor;
+      g_signalUp_lastConfirmedSeq = buySeq;
+      signal = +1;
+   }
+   else if(sellConfirmed)
+   {
+      g_signalDn_lastConfirmedAnchor = sellAnchor;
+      g_signalDn_lastConfirmedSeq = sellSeq;
+      signal = -1;
    }
 
    if(signal != 0)
    {
-      g_lastSignalTime = now;
+      g_lastSignalTime = TimeCurrent();
       g_noSignalBars = 0;
    }
 
@@ -1032,7 +1305,7 @@ void PlaceOriginalEntries(int signal)
    if(sys1Pos >= InpSys1_MaxPositions) return;
 
    // Check min seconds between entries
-   if(TimeCurrent() - g_lastTradeTime < InpSys1_MinSecBetween) return;
+   if(TimeCurrent() - g_lastTradeTime < g_effSys1MinSecBetween) return;
 
    // Check opposite direction
    if(!InpAllowOppositeDirection)
@@ -1108,11 +1381,22 @@ void PlaceReversalEntries()
    }
    else if(InpReversal_PullbackMode == PB_OppositeSignal)
    {
-      // Use opposite impulse/timebomb for reversal signal
+      // Use opposite buffered signal matcher without consuming main-entry anchors
+      datetime revAnchor = 0;
+      int revSeq = -1;
       if(g_lastTPHitDirection > 0) // was BUY, look for SELL signal
-         pullbackDetected = (DetectTimeBombDown() && DetectImpulseDown());
+      {
+         pullbackDetected = ConfirmSellSignalBuffered(false, "reversal tb+imp buffered", revAnchor, revSeq);
+      }
       else
-         pullbackDetected = (DetectTimeBombUp() && DetectImpulseUp());
+      {
+         pullbackDetected = ConfirmBuySignalBuffered(false, "reversal tb+imp buffered", revAnchor, revSeq);
+      }
+
+      if(!pullbackDetected)
+         Print("Reversal pullback check: buffered tb+imp not confirmed, mode=", EnumToString(InpReversal_PullbackMode));
+      else
+         Print("Reversal pullback source=tb+imp buffered anchor=", TimeToString(revAnchor, TIME_SECONDS), " seq=", revSeq);
    }
    else // Candle pattern
    {
@@ -1181,7 +1465,7 @@ void PlaceGridOrdersOriginal(int signal)
 
    if(CountAllEAPositions() >= InpMaxPositionsTotal) return;
    if(CountPendings() >= InpMaxPendingsTotal) return;
-   if(TimeCurrent() - g_lastTradeTime < InpSys1_MinSecBetween) return;
+   if(TimeCurrent() - g_lastTradeTime < g_effSys1MinSecBetween) return;
 
    bool isBuy = (g_gridDirection > 0);
    if(!InpAllowOppositeDirection)
@@ -1262,7 +1546,7 @@ void PlaceGridOrdersReversal()
       if(!isBuy && CountPositions(-1, +1) > 0) return;
    }
 
-   if(TimeCurrent() - g_lastTradeTime < InpSys1_MinSecBetween) return;
+   if(TimeCurrent() - g_lastTradeTime < g_effSys1MinSecBetween) return;
 
    double basePrice = isBuy ? SymbolInfoDouble(g_symbol, SYMBOL_ASK) : SymbolInfoDouble(g_symbol, SYMBOL_BID);
    double baseLots = CalculateLotSize(InpReversal_SL_Pips);
@@ -1336,7 +1620,7 @@ void ManageExitSystem1()
       if(CountAllEAPositions() == 0 && CountPendings() == 0)
       {
          g_state = STATE_CoolingDown;
-         g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+         g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
       }
    }
 }
@@ -1523,7 +1807,7 @@ void ManageExitSystem2_Partials()
    if(CountAllEAPositions() == 0 && CountPendings() == 0)
    {
       g_state = STATE_CoolingDown;
-      g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+      g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
    }
 }
 
@@ -1668,7 +1952,7 @@ void ManageExitSystem3_Portfolio()
       if(CountPendings() == 0)
       {
          g_state = STATE_CoolingDown;
-         g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+         g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
          ResetCycleTracking();
       }
       return;
@@ -1686,7 +1970,7 @@ void ManageExitSystem3_Portfolio()
       Print("Portfolio TP reached! Profit=", portfolioProfit, " Target=", InpExit3_TargetValue);
       CloseAllEAOrdersAndPositions();
       g_state = STATE_CoolingDown;
-      g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+      g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
       ResetCycleTracking();
       return;
    }
@@ -1733,7 +2017,7 @@ void ManageExitSystem3_Portfolio()
       Print("Portfolio SL hit! Loss=", portfolioLoss, " Limit=", InpExit3_SLValue);
       CloseAllEAOrdersAndPositions();
       g_state = STATE_CoolingDown;
-      g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+      g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
       ResetCycleTracking();
       return;
    }
@@ -1803,7 +2087,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          if(g_state != STATE_OriginalTPHit)
          {
             g_state = STATE_CoolingDown;
-            g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+            g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
             ResetCycleTracking();
          }
 
@@ -1890,7 +2174,7 @@ void RunStateMachine(int signal)
          else
          {
             g_state = STATE_CoolingDown;
-            g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+            g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
          }
          break;
       }
@@ -1901,7 +2185,7 @@ void RunStateMachine(int signal)
          if(g_lastTPHitTime > 0 && TimeCurrent() - g_lastTPHitTime > InpReversal_MaxSecsAfterTP)
          {
             g_state = STATE_CoolingDown;
-            g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+            g_cooldownUntil = TimeCurrent() + g_effCooldownSecondsAfterTrade;
             g_lastTPHitTime = 0;
             break;
          }
@@ -1977,9 +2261,13 @@ void OnTick()
    bool isNewBar = (barTime != g_lastBarTime);
    g_lastBarTime = barTime;
 
-   // Detect signal
+   // Update detectors once/tick, then evaluate only in entry states
+   UpdateSignalEventState();
+
+   bool isSignalEvaluationActive = (g_state == STATE_Idle || g_state == STATE_OriginalSignalTriggered ||
+                                   (InpUseOriginalSignalProfile && g_state == STATE_ReversalEligibleWindow));
    int signal = 0;
-   if(g_state == STATE_Idle || g_state == STATE_OriginalSignalTriggered)
+   if(isSignalEvaluationActive)
       signal = DetectSignal();
 
    // Run state machine
@@ -1988,14 +2276,17 @@ void OnTick()
    // Diagnostics for long no-signal runs
    if(isNewBar)
    {
-      if(signal == 0)
-         g_noSignalBars++;
-      else
-         g_noSignalBars = 0;
+      if(isSignalEvaluationActive)
+      {
+         if(signal == 0)
+            g_noSignalBars++;
+         else
+            g_noSignalBars = 0;
+      }
    }
 
    if(signal == 0)
-      LogNoSignalDiagnostics();
+      LogNoSignalDiagnostics(isSignalEvaluationActive);
 
    // Manage exits
    ManageExits();
