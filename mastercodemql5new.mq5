@@ -132,21 +132,33 @@ input int      InpCooldownSecondsAfterTrade = 60;      // Cooldown Seconds After
 input bool     InpAllowOppositeDirection = true;       // Allow Opposite Direction Positions
 
 //--- SIGNAL (Ported from original EA)
-input double   InpTimeBombUpPips        = 50.0;        // TimeBomb Up: Pips Threshold
-input double   InpTimeBombUpSeconds     = 3.0;         // TimeBomb Up: Time Window (seconds)
-input double   InpTimeBombDownPips      = 50.0;        // TimeBomb Down: Pips Threshold
-input double   InpTimeBombDownSeconds   = 3.0;         // TimeBomb Down: Time Window (seconds)
+input double   InpTimeBombUpPips        = 8.0;         // TimeBomb Up: Pips Threshold (XAUUSD M1 production)
+input double   InpTimeBombUpSeconds     = 8.0;         // TimeBomb Up: Time Window (seconds)
+input double   InpTimeBombDownPips      = 8.0;         // TimeBomb Down: Pips Threshold (XAUUSD M1 production)
+input double   InpTimeBombDownSeconds   = 8.0;         // TimeBomb Down: Time Window (seconds)
 input ENUM_SIGNAL_TYPE InpSignalType    = SIG_Continuous; // Signal Type
 input int      InpImpulseQuietBars      = 3;           // Impulse: Quiet Bars Count
 input double   InpImpulseQuietMinRange  = 1.0;         // Impulse: Quiet Bars Min Range (pips)
-input double   InpImpulseStrength       = 1.5;         // Impulse: Strength Multiplier
+input double   InpImpulseStrength       = 1.2;         // Impulse: Strength Multiplier
 input int      InpImpulseShift          = 0;           // Impulse: Bar Shift
-input int      InpSignalConfirmWindowSec = 3;          // Signal: TB/Impulse confirm window (sec)
-input int      InpSignalConfirmWindowBars = 2;         // Signal: TB/Impulse confirm window (bars)
+input int      InpSignalConfirmWindowSec = 8;          // Signal: TB/Impulse confirm window (sec)
+input int      InpSignalConfirmWindowBars = 3;         // Signal: TB/Impulse confirm window (bars)
 input bool     InpAllowImpulseOnlyFallback = true;     // Signal: allow impulse-only fallback if no TB
 input int      InpImpulseOnlyFallbackBars = 20;        // Signal: bars without TB before fallback
 input bool     InpRequireTBHistoryBeforeFallback = true; // Signal: require TB history before fallback
+input int      InpFallbackStartupGraceBars = 6;        // Signal fallback: startup grace bars before TB history is optional
+input int      InpFallbackStartupGraceSec  = 120;      // Signal fallback: startup grace seconds before TB history is optional
+input int      InpFallbackForceAfterBarsNoTB = 45;     // Signal fallback: force allow after bars with no TB history
 input bool     InpUseOriginalSignalProfile = false;    // Signal: use original-compatible profile defaults
+input bool     InpUseXAUUSDM1ProductionPreset = true;  // Signal: apply XAUUSD M1 production preset defaults
+input bool     InpWarnStrictSignalConfigAtStartup = true; // Signal: startup strict/high-risk config warning
+input int      InpSignalAtrLookbackBars = 14;          // Signal diagnostics: ATR lookback bars
+input double   InpStrictTbAtrRatio = 2.5;              // Strict if TB pips > ATR*preset ratio
+input double   InpStrictMinTicksPerSecond = 0.40;      // Strict if tick rate below this while TB seconds mode is active
+input bool     InpEnableTickFreqGuard = true;          // Tick guard: monitor low tick frequency each new bar
+input int      InpTickFreqLookbackBars = 5;            // Tick guard: lookback bars
+input double   InpTickFreqWarnThreshold = 0.35;        // Tick guard: warning threshold (ticks/sec)
+input bool     InpTickFreqAutoBarFallback = true;      // Tick guard: auto widen to bar-based fallback profile
 
 enum ENUM_SIGNAL_CONFLICT_POLICY
 {
@@ -328,6 +340,7 @@ int            g_impDn_lastFireSeq = 0;
 bool           g_tbHistoryKnownUp = false;
 bool           g_tbHistoryKnownDn = false;
 datetime       g_eaInitTime = 0;
+datetime       g_eaInitTickTime = 0;
 
 // Effective parameters (can be profile-adjusted)
 double         g_effTimeBombUpPips = 0.0;
@@ -340,13 +353,19 @@ int            g_effSignalConfirmWindowSec = 0;
 int            g_effSignalConfirmWindowBars = 0;
 bool           g_effAllowImpulseOnlyFallback = false;
 int            g_effImpulseOnlyFallbackBars = 0;
+bool           g_effRequireTBHistoryBeforeFallback = true;
 int            g_effCooldownSecondsAfterTrade = 0;
 int            g_effSys1MinSecBetween = 0;
+bool           g_tickFreqBarFallbackActive = false;
 
 // Grid state
 datetime       g_gridActivationTime = 0;
 bool           g_gridActivated = false;
 int            g_gridDirection = 0; // 1=BUY grid, -1=SELL grid
+
+// Throttled reason-code logging (once per bar per reason)
+string         g_reasonLogKeys[];
+datetime       g_reasonLogBarTimes[];
 
 // Partial close tracking (per-position flags stored by ticket)
 long           g_partialClosedTickets[];
@@ -367,6 +386,13 @@ datetime       g_weeklyResetTime = 0;
 //+------------------------------------------------------------------+
 void ManageExits();
 void ResetCycleTracking();
+bool ShouldEmitReasonLog(string reasonKey);
+void LogEarlyReturn(string funcName, string reasonCode, int signal, string thresholds = "");
+double EstimateAverageTicksPerSecond(int lookbackBars);
+double EstimateAtrPips(int lookbackBars);
+void LogSignalConfigRiskAtStartup();
+void EvaluateTickFrequencyGuard(bool isNewBar);
+void ResetGridActivationState(string reasonCode);
 
 bool ValidateInputs()
 {
@@ -380,6 +406,10 @@ bool ValidateInputs()
    if(InpSignalConfirmWindowSec < 0) return false;
    if(InpSignalConfirmWindowBars < 0) return false;
    if(InpImpulseOnlyFallbackBars < 1) return false;
+   if(InpFallbackStartupGraceBars < 0 || InpFallbackStartupGraceSec < 0) return false;
+   if(InpFallbackForceAfterBarsNoTB < 0) return false;
+   if(InpSignalAtrLookbackBars < 2 || InpTickFreqLookbackBars < 1) return false;
+   if(InpStrictTbAtrRatio <= 0 || InpStrictMinTicksPerSecond <= 0 || InpTickFreqWarnThreshold <= 0) return false;
 
    if(InpSys1_MaxPositions < 1 || InpSys1_MinSecBetween < 0) return false;
    if(InpGrid_MaxOrders < 1 || InpGrid_StepPips <= 0 || InpGrid_ActivationDelay < 0) return false;
@@ -416,6 +446,157 @@ void ResetCycleTracking()
    g_portfolioPartialLossDone = false;
    g_partialClosedCount = 0;
    ArrayResize(g_partialClosedTickets, 0);
+}
+
+bool ShouldEmitReasonLog(string reasonKey)
+{
+   datetime barTime = iTime(g_symbol, g_timeframe, 0);
+   int size = ArraySize(g_reasonLogKeys);
+   for(int i = 0; i < size; i++)
+   {
+      if(g_reasonLogKeys[i] == reasonKey)
+      {
+         if(g_reasonLogBarTimes[i] == barTime)
+            return false;
+         g_reasonLogBarTimes[i] = barTime;
+         return true;
+      }
+   }
+
+   ArrayResize(g_reasonLogKeys, size + 1);
+   ArrayResize(g_reasonLogBarTimes, size + 1);
+   g_reasonLogKeys[size] = reasonKey;
+   g_reasonLogBarTimes[size] = barTime;
+   return true;
+}
+
+void LogEarlyReturn(string funcName, string reasonCode, int signal, string thresholds = "")
+{
+   string reasonKey = funcName + "|" + reasonCode;
+   if(!ShouldEmitReasonLog(reasonKey))
+      return;
+
+   int totalPos = CountAllEAPositions();
+   int totalPend = CountPendings();
+   Print("ENTRY_BLOCK[", funcName, "] reason=", reasonCode,
+         " state=", EnumToString(g_state),
+         " signal=", signal,
+         " pos=", totalPos,
+         " pend=", totalPend,
+         " lastTrade=", TimeToString(g_lastTradeTime, TIME_SECONDS),
+         " now=", TimeToString(TimeCurrent(), TIME_SECONDS),
+         " thresholds=", thresholds);
+}
+
+double EstimateAverageTicksPerSecond(int lookbackBars)
+{
+   int bars = MathMax(1, lookbackBars);
+   int tfSec = PeriodSeconds(g_timeframe);
+   if(tfSec <= 0) tfSec = 60;
+
+   double sumTicks = 0.0;
+   int usedBars = 0;
+   for(int i = 1; i <= bars; i++)
+   {
+      long tv = iVolume(g_symbol, g_timeframe, i);
+      if(tv <= 0) continue;
+      sumTicks += (double)tv;
+      usedBars++;
+   }
+   if(usedBars == 0) return 0.0;
+   return sumTicks / (usedBars * tfSec);
+}
+
+double EstimateAtrPips(int lookbackBars)
+{
+   int bars = MathMax(2, lookbackBars);
+   double trSum = 0.0;
+   int usedBars = 0;
+
+   for(int i = 1; i <= bars; i++)
+   {
+      double high = iHigh(g_symbol, g_timeframe, i);
+      double low = iLow(g_symbol, g_timeframe, i);
+      double prevClose = iClose(g_symbol, g_timeframe, i + 1);
+      if(high <= 0 || low <= 0 || prevClose <= 0) continue;
+
+      double tr = MathMax(high - low,
+                          MathMax(MathAbs(high - prevClose), MathAbs(low - prevClose)));
+      trSum += tr;
+      usedBars++;
+   }
+   if(usedBars == 0) return 0.0;
+   return PriceToPips(trSum / usedBars);
+}
+
+void LogSignalConfigRiskAtStartup()
+{
+   if(!InpWarnStrictSignalConfigAtStartup)
+      return;
+
+   double atrPips = EstimateAtrPips(InpSignalAtrLookbackBars);
+   double tickRate = EstimateAverageTicksPerSecond(MathMax(2, InpTickFreqLookbackBars));
+   double maxTbPips = MathMax(g_effTimeBombUpPips, g_effTimeBombDownPips);
+   bool strictByAtr = (atrPips > 0 && maxTbPips > atrPips * InpStrictTbAtrRatio);
+   bool strictByTickRate = ((g_effTimeBombUpSeconds > 0 || g_effTimeBombDownSeconds > 0) &&
+                            tickRate > 0 && tickRate < InpStrictMinTicksPerSecond);
+   bool strictNoTrade = (strictByAtr || strictByTickRate);
+
+   Print("Signal risk profile: ", (strictNoTrade ? "STRICT/HIGH-RISK NO-TRADE" : "OK"),
+         " atrPips=", DoubleToString(atrPips, 2),
+         " tickRate=", DoubleToString(tickRate, 3), " ticks/sec",
+         " tbPips(up/dn)=", DoubleToString(g_effTimeBombUpPips, 2), "/", DoubleToString(g_effTimeBombDownPips, 2),
+         " tbSec(up/dn)=", DoubleToString(g_effTimeBombUpSeconds, 2), "/", DoubleToString(g_effTimeBombDownSeconds, 2),
+         " strictByATR=", (strictByAtr ? "Y" : "N"),
+         " strictByTickRate=", (strictByTickRate ? "Y" : "N"));
+}
+
+void EvaluateTickFrequencyGuard(bool isNewBar)
+{
+   if(!isNewBar || !InpEnableTickFreqGuard)
+      return;
+
+   if(g_effTimeBombUpSeconds <= 0 && g_effTimeBombDownSeconds <= 0)
+      return;
+
+   double tickRate = EstimateAverageTicksPerSecond(InpTickFreqLookbackBars);
+   if(tickRate >= InpTickFreqWarnThreshold || tickRate <= 0)
+      return;
+
+   Print("WARNING: Low tick frequency detected. ticks/sec=", DoubleToString(tickRate, 3),
+         " threshold=", DoubleToString(InpTickFreqWarnThreshold, 3),
+         " TB seconds mode active. Tester may miss short TB windows.");
+
+   if(InpTickFreqAutoBarFallback && !g_tickFreqBarFallbackActive)
+   {
+      g_tickFreqBarFallbackActive = true;
+      g_effTimeBombUpSeconds = MathMax(g_effTimeBombUpSeconds, 15.0);
+      g_effTimeBombDownSeconds = MathMax(g_effTimeBombDownSeconds, 15.0);
+      g_effSignalConfirmWindowSec = MathMax(g_effSignalConfirmWindowSec, 12);
+      g_effSignalConfirmWindowBars = MathMax(g_effSignalConfirmWindowBars, 4);
+      g_effAllowImpulseOnlyFallback = true;
+      g_effRequireTBHistoryBeforeFallback = false;
+      Print("Tick frequency guard switched to bar-heavy fallback profile: TB sec up/dn=",
+            DoubleToString(g_effTimeBombUpSeconds, 1), "/", DoubleToString(g_effTimeBombDownSeconds, 1),
+            " confirmSec=", g_effSignalConfirmWindowSec,
+            " confirmBars=", g_effSignalConfirmWindowBars,
+            " requireTBHistoryFallback=OFF");
+   }
+}
+
+void ResetGridActivationState(string reasonCode)
+{
+   if(g_gridActivationTime == 0 && !g_gridActivated && g_gridDirection == 0)
+      return;
+
+   Print("Grid activation reset: reason=", reasonCode,
+         " state=", EnumToString(g_state),
+         " dir=", g_gridDirection,
+         " activated=", (g_gridActivated ? "Y" : "N"),
+         " start=", TimeToString(g_gridActivationTime, TIME_SECONDS));
+   g_gridActivated = false;
+   g_gridActivationTime = 0;
+   g_gridDirection = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -466,8 +647,24 @@ int OnInit()
    g_effSignalConfirmWindowBars = InpSignalConfirmWindowBars;
    g_effAllowImpulseOnlyFallback = InpAllowImpulseOnlyFallback;
    g_effImpulseOnlyFallbackBars = InpImpulseOnlyFallbackBars;
+   g_effRequireTBHistoryBeforeFallback = InpRequireTBHistoryBeforeFallback;
    g_effCooldownSecondsAfterTrade = InpCooldownSecondsAfterTrade;
    g_effSys1MinSecBetween = InpSys1_MinSecBetween;
+
+   if(InpUseXAUUSDM1ProductionPreset)
+   {
+      g_effTimeBombUpPips = 8.0;
+      g_effTimeBombDownPips = 8.0;
+      g_effTimeBombUpSeconds = 9.0;
+      g_effTimeBombDownSeconds = 9.0;
+      g_effImpulseQuietBars = 3;
+      g_effImpulseStrength = 1.15;
+      g_effSignalConfirmWindowSec = 8;
+      g_effSignalConfirmWindowBars = 3;
+      g_effAllowImpulseOnlyFallback = true;
+      g_effImpulseOnlyFallbackBars = MathMax(12, InpImpulseOnlyFallbackBars);
+      g_effRequireTBHistoryBeforeFallback = InpRequireTBHistoryBeforeFallback;
+   }
 
    if(InpUseOriginalSignalProfile)
    {
@@ -481,11 +678,13 @@ int OnInit()
       g_effSignalConfirmWindowBars = 1;
       g_effAllowImpulseOnlyFallback = false;
       g_effImpulseOnlyFallbackBars = MathMax(5, InpImpulseOnlyFallbackBars);
+      g_effRequireTBHistoryBeforeFallback = true;
       g_effCooldownSecondsAfterTrade = MathMin(InpCooldownSecondsAfterTrade, 5);
       g_effSys1MinSecBetween = MathMin(InpSys1_MinSecBetween, 1);
    }
 
    g_eaInitTime = iTime(g_symbol, g_timeframe, 0);
+   g_eaInitTickTime = TimeCurrent();
 
    Print("=== Master Trader V2.0 Initialized ===");
    Print("Symbol: ", g_symbol, " TF: ", EnumToString(g_timeframe));
@@ -501,8 +700,10 @@ int OnInit()
          " confirmBars=", g_effSignalConfirmWindowBars,
          " fallback=", (g_effAllowImpulseOnlyFallback ? "ON" : "OFF"),
          " fallbackBars=", g_effImpulseOnlyFallbackBars,
+         " requireTBHistoryFallback=", (g_effRequireTBHistoryBeforeFallback ? "ON" : "OFF"),
          " cooldownSec=", g_effCooldownSecondsAfterTrade,
          " minSecBetween=", g_effSys1MinSecBetween);
+   LogSignalConfigRiskAtStartup();
    Print("======================================");
 
    return INIT_SUCCEEDED;
