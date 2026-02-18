@@ -150,7 +150,7 @@ input int      InpFallbackStartupGraceBars = 6;        // Signal fallback: start
 input int      InpFallbackStartupGraceSec  = 120;      // Signal fallback: startup grace seconds before TB history is optional
 input int      InpFallbackForceAfterBarsNoTB = 45;     // Signal fallback: force allow after bars with no TB history
 input bool     InpUseOriginalSignalProfile = false;    // Signal: use original-compatible profile defaults
-input bool     InpUseXAUUSDM1ProductionPreset = true;  // Signal: apply XAUUSD M1 production preset defaults
+input bool     InpUseXAUUSDM1ProductionPreset = false; // Signal: apply XAUUSD M1 production preset defaults (recommended only for XAUUSD M1)
 input bool     InpWarnStrictSignalConfigAtStartup = true; // Signal: startup strict/high-risk config warning
 input int      InpSignalAtrLookbackBars = 14;          // Signal diagnostics: ATR lookback bars
 input double   InpStrictTbAtrRatio = 2.5;              // Strict if TB pips > ATR*preset ratio
@@ -168,7 +168,8 @@ enum ENUM_SIGNAL_CONFLICT_POLICY
    CONFLICT_PreferSell   = 3
 };
 
-input ENUM_SIGNAL_CONFLICT_POLICY InpSignalConflictPolicy = CONFLICT_SkipBoth; // Signal conflict resolution
+input ENUM_SIGNAL_CONFLICT_POLICY InpSignalConflictPolicy = CONFLICT_MostRecent; // Signal conflict policy (recommended: MostRecent for fast markets, SkipBoth for choppy ranges)
+input int      InpConflictSummaryEveryBars = 20;       // Signal conflict diagnostics summary cadence (bars)
 
 //--- ENTRY SYSTEM MASTER SWITCH
 input ENUM_ENTRY_SYSTEM InpEntrySystemMode = ENTRY_System1_SingleReversal; // Entry System Mode
@@ -357,6 +358,11 @@ bool           g_effRequireTBHistoryBeforeFallback = true;
 int            g_effCooldownSecondsAfterTrade = 0;
 int            g_effSys1MinSecBetween = 0;
 bool           g_tickFreqBarFallbackActive = false;
+int            g_conflictsTotal = 0;
+int            g_conflictsDiscardedBuy = 0;
+int            g_conflictsDiscardedSell = 0;
+int            g_conflictsSkipBoth = 0;
+int            g_conflictSummaryBarsCounter = 0;
 
 // Grid state
 datetime       g_gridActivationTime = 0;
@@ -368,7 +374,7 @@ string         g_reasonLogKeys[];
 datetime       g_reasonLogBarTimes[];
 
 // Partial close tracking (per-position flags stored by ticket)
-long           g_partialClosedTickets[];
+ulong          g_partialClosedTickets[];
 int            g_partialClosedCount = 0;
 
 // Portfolio partial tracking
@@ -410,6 +416,7 @@ bool ValidateInputs()
    if(InpFallbackForceAfterBarsNoTB < 0) return false;
    if(InpSignalAtrLookbackBars < 2 || InpTickFreqLookbackBars < 1) return false;
    if(InpStrictTbAtrRatio <= 0 || InpStrictMinTicksPerSecond <= 0 || InpTickFreqWarnThreshold <= 0) return false;
+   if(InpConflictSummaryEveryBars < 1) return false;
 
    if(InpSys1_MaxPositions < 1 || InpSys1_MinSecBetween < 0) return false;
    if(InpGrid_MaxOrders < 1 || InpGrid_StepPips <= 0 || InpGrid_ActivationDelay < 0) return false;
@@ -599,6 +606,13 @@ void ResetGridActivationState(string reasonCode)
    g_gridDirection = 0;
 }
 
+bool IsXauUsdLikeSymbol(string sym)
+{
+   string up = sym;
+   StringToUpper(up);
+   return (StringFind(up, "XAUUSD") >= 0 || StringFind(up, "GOLD") >= 0);
+}
+
 //+------------------------------------------------------------------+
 //|                        INITIALIZATION                              |
 //+------------------------------------------------------------------+
@@ -614,6 +628,12 @@ int OnInit()
    g_symbol = (InpSymbol == "" || InpSymbol == "current") ? _Symbol : InpSymbol;
    g_timeframe = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
 
+   if(!SymbolSelect(g_symbol, true))
+   {
+      Print("Init failed: SymbolSelect failed for ", g_symbol, " err=", GetLastError());
+      return INIT_FAILED;
+   }
+
    // Cache symbol properties
    g_digits      = (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS);
    g_point       = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
@@ -623,6 +643,24 @@ int OnInit()
    g_lotMax      = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
    g_stopsLevel  = SymbolInfoInteger(g_symbol, SYMBOL_TRADE_STOPS_LEVEL);
    g_freezeLevel = SymbolInfoInteger(g_symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+
+   if(g_point <= 0 || g_digits < 0 || g_lotMin <= 0 || g_lotStep <= 0)
+   {
+      Print("Init failed: invalid symbol properties for ", g_symbol,
+            " point=", g_point,
+            " digits=", g_digits,
+            " volumeMin=", g_lotMin,
+            " volumeStep=", g_lotStep);
+      return INIT_FAILED;
+   }
+
+   MqlTick initTick;
+   if(!SymbolInfoTick(g_symbol, initTick))
+   {
+      Print("Init failed: SymbolInfoTick unavailable for ", g_symbol, " err=", GetLastError());
+      return INIT_FAILED;
+   }
+
    g_pipValue    = GetPipValuePoints();
 
    // Setup trade object
@@ -651,19 +689,36 @@ int OnInit()
    g_effCooldownSecondsAfterTrade = InpCooldownSecondsAfterTrade;
    g_effSys1MinSecBetween = InpSys1_MinSecBetween;
 
-   if(InpUseXAUUSDM1ProductionPreset)
+   bool xauPresetRequested = InpUseXAUUSDM1ProductionPreset;
+   bool xauPresetApplied = false;
+   bool xauSymbolOk = IsXauUsdLikeSymbol(g_symbol);
+   bool xauTfOk = (g_timeframe == PERIOD_M1);
+
+   if(xauPresetRequested)
    {
-      g_effTimeBombUpPips = 8.0;
-      g_effTimeBombDownPips = 8.0;
-      g_effTimeBombUpSeconds = 9.0;
-      g_effTimeBombDownSeconds = 9.0;
-      g_effImpulseQuietBars = 3;
-      g_effImpulseStrength = 1.15;
-      g_effSignalConfirmWindowSec = 8;
-      g_effSignalConfirmWindowBars = 3;
-      g_effAllowImpulseOnlyFallback = true;
-      g_effImpulseOnlyFallbackBars = MathMax(12, InpImpulseOnlyFallbackBars);
-      g_effRequireTBHistoryBeforeFallback = InpRequireTBHistoryBeforeFallback;
+      if(xauSymbolOk && xauTfOk)
+      {
+         g_effTimeBombUpPips = 8.0;
+         g_effTimeBombDownPips = 8.0;
+         g_effTimeBombUpSeconds = 9.0;
+         g_effTimeBombDownSeconds = 9.0;
+         g_effImpulseQuietBars = 3;
+         g_effImpulseStrength = 1.15;
+         g_effSignalConfirmWindowSec = 8;
+         g_effSignalConfirmWindowBars = 3;
+         g_effAllowImpulseOnlyFallback = true;
+         g_effImpulseOnlyFallbackBars = MathMax(12, InpImpulseOnlyFallbackBars);
+         g_effRequireTBHistoryBeforeFallback = InpRequireTBHistoryBeforeFallback;
+         xauPresetApplied = true;
+      }
+      else
+      {
+         Print("WARNING: XAUUSD M1 preset requested but skipped. symbolOk=", (xauSymbolOk ? "Y" : "N"),
+               " tfOk=", (xauTfOk ? "Y" : "N"),
+               " symbol=", g_symbol,
+               " tf=", EnumToString(g_timeframe),
+               " -> using custom/default parameters.");
+      }
    }
 
    if(InpUseOriginalSignalProfile)
@@ -691,7 +746,10 @@ int OnInit()
    Print("Entry System: ", EnumToString(InpEntrySystemMode));
    Print("Exit System: ", EnumToString(InpExitSystemMode));
    Print("Pip Value Points: ", g_pipValue);
-   Print("Signal Profile: ", (InpUseOriginalSignalProfile ? "Original-Compatible" : "Advanced/Custom"));
+   Print("Signal Profile: ", (InpUseOriginalSignalProfile ? "Original-Compatible" : "Advanced/Custom"),
+         " xauPresetRequested=", (xauPresetRequested ? "Y" : "N"),
+         " xauPresetApplied=", (xauPresetApplied ? "Y" : "N"),
+         " tickGuardEnabled=", (InpEnableTickFreqGuard ? "Y" : "N"));
    Print("Effective Signal: TB(up/dn pips)=", g_effTimeBombUpPips, "/", g_effTimeBombDownPips,
          " TB(up/dn sec)=", g_effTimeBombUpSeconds, "/", g_effTimeBombDownSeconds,
          " impulseQuietBars=", g_effImpulseQuietBars,
@@ -1200,21 +1258,62 @@ bool IsImpulseFallbackEligible(bool isBuy, bool &tbHistoryKnown, bool &fallbackE
 {
    tbHistoryKnown = isBuy ? g_tbHistoryKnownUp : g_tbHistoryKnownDn;
    int completedBarsSinceInit = BarsSinceTimestamp(g_eaInitTime);
+   int secSinceInit = (g_eaInitTickTime > 0) ? (int)(TimeCurrent() - g_eaInitTickTime) : 2147483647;
    bool startupReady = (completedBarsSinceInit >= g_effImpulseOnlyFallbackBars);
 
-   bool tbGapReady = false;
+   bool normalHistoryRule = false;
    if(tbHistoryKnown)
    {
       datetime tbLast = isBuy ? g_tbUp_lastFireTime : g_tbDn_lastFireTime;
       int barsSinceTb = BarsSinceTimestamp(tbLast);
-      tbGapReady = (barsSinceTb >= g_effImpulseOnlyFallbackBars);
+      normalHistoryRule = (barsSinceTb >= g_effImpulseOnlyFallbackBars);
    }
    else
    {
-      tbGapReady = !InpRequireTBHistoryBeforeFallback;
+      normalHistoryRule = !g_effRequireTBHistoryBeforeFallback;
    }
 
-   fallbackEligible = startupReady && tbGapReady;
+   bool startupGraceRule = false;
+   if(!tbHistoryKnown && g_effRequireTBHistoryBeforeFallback)
+   {
+      bool graceBars = (InpFallbackStartupGraceBars > 0 && completedBarsSinceInit >= 0 && completedBarsSinceInit <= InpFallbackStartupGraceBars);
+      bool graceSec = (InpFallbackStartupGraceSec > 0 && secSinceInit >= 0 && secSinceInit <= InpFallbackStartupGraceSec);
+      startupGraceRule = (graceBars || graceSec);
+   }
+
+   bool forcedNoTbRule = false;
+   if(!tbHistoryKnown && InpFallbackForceAfterBarsNoTB > 0 && completedBarsSinceInit >= InpFallbackForceAfterBarsNoTB)
+      forcedNoTbRule = true;
+
+   string clause = "none";
+   bool historyClause = normalHistoryRule;
+   if(forcedNoTbRule)
+   {
+      historyClause = true;
+      clause = "forced-no-tb";
+   }
+   else if(startupGraceRule)
+   {
+      historyClause = true;
+      clause = "startup-grace";
+   }
+   else if(normalHistoryRule)
+   {
+      clause = "normal";
+   }
+
+   fallbackEligible = (startupReady && historyClause);
+
+   if(fallbackEligible)
+   {
+      Print("Fallback eligible dir=", (isBuy ? "BUY" : "SELL"),
+            " clause=", clause,
+            " barsSinceInit=", completedBarsSinceInit,
+            " secSinceInit=", secSinceInit,
+            " tbHistoryKnown=", (tbHistoryKnown ? "Y" : "N"),
+            " requireTBHistory=", (g_effRequireTBHistoryBeforeFallback ? "Y" : "N"));
+   }
+
    return fallbackEligible;
 }
 
@@ -1292,8 +1391,12 @@ int DetectSignal()
 
    if(buyConfirmed && sellConfirmed)
    {
+      g_conflictsTotal++;
       if(InpSignalConflictPolicy == CONFLICT_SkipBoth)
       {
+         g_conflictsSkipBoth++;
+         g_conflictsDiscardedBuy++;
+         g_conflictsDiscardedSell++;
          Print("Signal conflict: BUY and SELL confirmed. Policy=SkipBoth buyAnchor=", TimeToString(buyAnchor, TIME_SECONDS),
                " sellAnchor=", TimeToString(sellAnchor, TIME_SECONDS));
          return 0;
@@ -1310,9 +1413,15 @@ int DetectSignal()
             buyConfirmed = false;
       }
 
+      if(buyConfirmed)
+         g_conflictsDiscardedSell++;
+      else
+         g_conflictsDiscardedBuy++;
+
       Print("Signal conflict resolved. Policy=", EnumToString(InpSignalConflictPolicy),
             " chosen=", (buyConfirmed ? "BUY" : "SELL"),
-            " buySeq=", buySeq, " sellSeq=", sellSeq);
+            " buySeq=", buySeq, " sellSeq=", sellSeq,
+            " conflictsTotal=", g_conflictsTotal);
    }
 
    if(buyConfirmed)
@@ -1419,9 +1528,9 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
       bool result = false;
 
       if(isBuy)
-         result = g_trade.Buy(lots, g_symbol, price, slPrice, tpPrice, fullComment);
+         result = g_trade.Buy(lots, g_symbol, 0.0, slPrice, tpPrice, fullComment);
       else
-         result = g_trade.Sell(lots, g_symbol, price, slPrice, tpPrice, fullComment);
+         result = g_trade.Sell(lots, g_symbol, 0.0, slPrice, tpPrice, fullComment);
 
       if(result && g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
       {
@@ -1433,8 +1542,17 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
       }
       else
       {
+         long spreadPoints = SymbolInfoInteger(g_symbol, SYMBOL_SPREAD);
+         double reqSlDistPips = (slPrice > 0) ? PriceToPips(MathAbs(price - slPrice)) : 0.0;
+         double reqTpDistPips = (tpPrice > 0) ? PriceToPips(MathAbs(price - tpPrice)) : 0.0;
          Print("Trade attempt ", attempt+1, " failed: ", g_trade.ResultRetcodeDescription(),
-               " Code: ", g_trade.ResultRetcode());
+               " Code: ", g_trade.ResultRetcode(),
+               " symbol=", g_symbol,
+               " spreadPts=", spreadPoints,
+               " reqSLPips=", DoubleToString(reqSlDistPips, 2),
+               " reqTPPips=", DoubleToString(reqTpDistPips, 2),
+               " slPrice=", slPrice,
+               " tpPrice=", tpPrice);
          if(g_trade.ResultRetcode() == TRADE_RETCODE_REQUOTE ||
             g_trade.ResultRetcode() == TRADE_RETCODE_PRICE_OFF)
          {
@@ -1521,9 +1639,7 @@ void PlaceOriginalEntries(int signal)
    string tag = isBuy ? "OrigBuy" : "OrigSell";
 
    if(ExecuteTradeWithRetry(isBuy, lots, InpOriginal_SL_Pips, InpOriginal_TP_Pips, magicOff, tag))
-   {
       g_state = STATE_OriginalPositionsRunning;
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -1682,6 +1798,7 @@ void PlaceGridOrdersOriginal(int signal)
 
    int existingGrid = CountPositions(baseMagic) + CountPendings(baseMagic);
 
+   int successfulPlacements = 0;
    for(int level = existingGrid; level < InpGrid_MaxOrders; level++)
    {
       double levelLots = baseLots;
@@ -1697,8 +1814,9 @@ void PlaceGridOrdersOriginal(int signal)
       if(level == 0 && InpGrid_Mode == GRID_MarketPlusPending)
       {
          // First order is market
-         ExecuteTradeWithRetry(isBuy, levelLots, InpOriginal_SL_Pips, InpOriginal_TP_Pips,
-                               baseMagic, "Grid_L" + IntegerToString(level));
+         if(ExecuteTradeWithRetry(isBuy, levelLots, InpOriginal_SL_Pips, InpOriginal_TP_Pips,
+                                  baseMagic, "Grid_L" + IntegerToString(level)))
+            successfulPlacements++;
       }
       else
       {
@@ -1724,13 +1842,21 @@ void PlaceGridOrdersOriginal(int signal)
 
          if(orderPrice <= 0) continue;
 
-         PlacePendingOrder(isBuy, isLimit, orderPrice, levelLots,
-                           InpOriginal_SL_Pips, InpOriginal_TP_Pips,
-                           baseMagic, "Grid_L" + IntegerToString(level));
+         if(PlacePendingOrder(isBuy, isLimit, orderPrice, levelLots,
+                              InpOriginal_SL_Pips, InpOriginal_TP_Pips,
+                              baseMagic, "Grid_L" + IntegerToString(level)))
+            successfulPlacements++;
       }
    }
 
-   g_state = STATE_OriginalPositionsRunning;
+   int gridAfter = CountPositions(baseMagic) + CountPendings(baseMagic);
+   if(successfulPlacements > 0 || gridAfter > 0)
+      g_state = STATE_OriginalPositionsRunning;
+   else
+   {
+      g_state = STATE_Idle;
+      Print("Grid original placement: zero successful placements and no existing grid; keeping state idle for reattempt.");
+   }
 }
 
 void PlaceGridOrdersReversal()
@@ -1758,6 +1884,7 @@ void PlaceGridOrdersReversal()
    int existingGrid = CountPositions(baseMagic) + CountPendings(baseMagic);
    if(existingGrid >= InpGrid_MaxOrders) return;
 
+   int successfulPlacements = 0;
    for(int level = existingGrid; level < InpGrid_MaxOrders; level++)
    {
       double levelLots = baseLots;
@@ -1772,8 +1899,9 @@ void PlaceGridOrdersReversal()
 
       if(level == 0 && InpGrid_Mode == GRID_MarketPlusPending)
       {
-         ExecuteTradeWithRetry(isBuy, levelLots, InpReversal_SL_Pips, InpReversal_TP_Pips,
-                               baseMagic, "RevGrid_L" + IntegerToString(level));
+         if(ExecuteTradeWithRetry(isBuy, levelLots, InpReversal_SL_Pips, InpReversal_TP_Pips,
+                                  baseMagic, "RevGrid_L" + IntegerToString(level)))
+            successfulPlacements++;
       }
       else
       {
@@ -1798,15 +1926,25 @@ void PlaceGridOrdersReversal()
 
          if(orderPrice <= 0) continue;
 
-         PlacePendingOrder(isBuy, isLimit, orderPrice, levelLots,
-                           InpReversal_SL_Pips, InpReversal_TP_Pips,
-                           baseMagic, "RevGrid_L" + IntegerToString(level));
+         if(PlacePendingOrder(isBuy, isLimit, orderPrice, levelLots,
+                              InpReversal_SL_Pips, InpReversal_TP_Pips,
+                              baseMagic, "RevGrid_L" + IntegerToString(level)))
+            successfulPlacements++;
       }
    }
 
-   g_state = STATE_ReversalPositionsRunning;
-   g_lastTPHitTime = 0;
-   g_peakAfterTP = 0;
+   int gridAfter = CountPositions(baseMagic) + CountPendings(baseMagic);
+   if(successfulPlacements > 0 || gridAfter > 0)
+   {
+      g_state = STATE_ReversalPositionsRunning;
+      g_lastTPHitTime = 0;
+      g_peakAfterTP = 0;
+   }
+   else
+   {
+      g_state = STATE_ReversalEligibleWindow;
+      Print("Reversal grid placement: zero successful placements and no existing grid; staying eligible for reattempt.");
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1829,14 +1967,14 @@ void ManageExitSystem1()
 //+------------------------------------------------------------------+
 //|                 EXIT SYSTEM 2: Partial Close                       |
 //+------------------------------------------------------------------+
-bool IsTicketPartialClosed(long ticket)
+bool IsTicketPartialClosed(ulong ticket)
 {
    for(int i = 0; i < g_partialClosedCount; i++)
       if(g_partialClosedTickets[i] == ticket) return true;
    return false;
 }
 
-void MarkTicketPartialClosed(long ticket)
+void MarkTicketPartialClosed(ulong ticket)
 {
    g_partialClosedCount++;
    ArrayResize(g_partialClosedTickets, g_partialClosedCount);
@@ -1951,7 +2089,7 @@ void ManageExitSystem2_Partials()
       long posMagic = g_posInfo.Magic();
       if(!IsOurMagic(posMagic)) continue;
 
-      long ticket = g_posInfo.Ticket();
+      ulong ticket = g_posInfo.Ticket();
       if(IsTicketPartialClosed(ticket)) continue;
 
       double entryPrice = g_posInfo.PriceOpen();
@@ -2444,7 +2582,7 @@ void OnTick()
    // Spread filter (optional, does NOT block if disabled)
    if(InpMaxSpreadFilterEnabled)
    {
-      double spread = SymbolInfoInteger(g_symbol, SYMBOL_SPREAD);
+      long spread = SymbolInfoInteger(g_symbol, SYMBOL_SPREAD);
       if(spread > InpMaxSpreadPoints)
       {
          ManageExits();
@@ -2462,6 +2600,8 @@ void OnTick()
    bool isNewBar = (barTime != g_lastBarTime);
    g_lastBarTime = barTime;
 
+   EvaluateTickFrequencyGuard(isNewBar);
+
    // Update detectors once/tick, then evaluate only in entry states
    UpdateSignalEventState();
 
@@ -2477,6 +2617,17 @@ void OnTick()
    // Diagnostics for long no-signal runs
    if(isNewBar)
    {
+      g_conflictSummaryBarsCounter++;
+      if(g_conflictSummaryBarsCounter >= InpConflictSummaryEveryBars)
+      {
+         Print("Conflict summary: bars=", g_conflictSummaryBarsCounter,
+               " total=", g_conflictsTotal,
+               " skipBoth=", g_conflictsSkipBoth,
+               " discardedBuy=", g_conflictsDiscardedBuy,
+               " discardedSell=", g_conflictsDiscardedSell,
+               " policy=", EnumToString(InpSignalConflictPolicy));
+         g_conflictSummaryBarsCounter = 0;
+      }
       if(isSignalEvaluationActive)
       {
          if(signal == 0)
