@@ -258,6 +258,7 @@ long           g_freezeLevel;
 ENUM_EA_STATE  g_state = STATE_Idle;
 datetime       g_lastTradeTime = 0;
 datetime       g_lastBarTime = 0;
+datetime       g_lastTradeBarTime = 0;
 datetime       g_cooldownUntil = 0;
 
 // TP-Hit detection for reversal
@@ -302,10 +303,69 @@ datetime       g_dailyResetTime = 0;
 datetime       g_weeklyResetTime = 0;
 
 //+------------------------------------------------------------------+
+//|                       FORWARD DECLARATIONS                        |
+//+------------------------------------------------------------------+
+void ManageExits();
+void ResetCycleTracking();
+
+bool ValidateInputs()
+{
+   if(InpMagicBase < 1) return false;
+   if(InpSlippagePoints < 0) return false;
+   if(InpCooldownSecondsAfterTrade < 0) return false;
+
+   if(InpTimeBombUpPips < 0 || InpTimeBombDownPips < 0) return false;
+   if(InpTimeBombUpSeconds <= 0 || InpTimeBombDownSeconds <= 0) return false;
+   if(InpImpulseQuietBars < 1 || InpImpulseStrength <= 0) return false;
+
+   if(InpSys1_MaxPositions < 1 || InpSys1_MinSecBetween < 0) return false;
+   if(InpGrid_MaxOrders < 1 || InpGrid_StepPips <= 0 || InpGrid_ActivationDelay < 0) return false;
+   if(InpGrid_LotMultiplier <= 0 || InpGrid_MaxTotalLots <= 0) return false;
+
+   if(InpFixedLot <= 0 || InpMaxLot <= 0) return false;
+   if(InpRiskPercentPerTrade <= 0 || InpEquityPercentForLots <= 0) return false;
+   if(InpMaxPositionsTotal < 1 || InpMaxPendingsTotal < 0) return false;
+
+   if(InpOriginal_TP_Pips < 0 || InpOriginal_SL_Pips < 0) return false;
+   if(InpReversal_TP_Pips < 0 || InpReversal_SL_Pips < 0) return false;
+
+   if(InpExit2_PartialClosePct <= 0 || InpExit2_PartialClosePct >= 100) return false;
+   if(InpExit2_ActivPctOfTP < 0 || InpExit2_ActivPctOfTP > 100) return false;
+   if(InpExit2_ActivPctOfSL < 0 || InpExit2_ActivPctOfSL > 100) return false;
+
+   if(InpExit3_TargetValue < 0 || InpExit3_SLValue < 0) return false;
+   if(InpExit3_PartialProfitTrigPct < 0 || InpExit3_PartialProfitTrigPct > 100) return false;
+   if(InpExit3_PartialProfitClosePct <= 0 || InpExit3_PartialProfitClosePct >= 100) return false;
+   if(InpExit3_PartialLossTrigPct < 0 || InpExit3_PartialLossTrigPct > 100) return false;
+   if(InpExit3_PartialLossClosePct <= 0 || InpExit3_PartialLossClosePct >= 100) return false;
+
+   return true;
+}
+
+bool IsOurMagic(long magic)
+{
+   return (magic >= InpMagicBase && magic <= InpMagicBase + 9999);
+}
+
+void ResetCycleTracking()
+{
+   g_portfolioPartialProfitDone = false;
+   g_portfolioPartialLossDone = false;
+   g_partialClosedCount = 0;
+   ArrayResize(g_partialClosedTickets, 0);
+}
+
+//+------------------------------------------------------------------+
 //|                        INITIALIZATION                              |
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   if(!ValidateInputs())
+   {
+      Print("Input validation failed. Check EA parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    // Resolve symbol
    g_symbol = (InpSymbol == "" || InpSymbol == "current") ? _Symbol : InpSymbol;
    g_timeframe = (InpTimeframe == PERIOD_CURRENT) ? (ENUM_TIMEFRAMES)_Period : InpTimeframe;
@@ -324,7 +384,6 @@ int OnInit()
    // Setup trade object
    g_trade.SetExpertMagicNumber((ulong)InpMagicBase);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
-   g_trade.SetTypeFilling(ORDER_FILLING_FOK);
    g_trade.SetTypeFillingBySymbol(g_symbol);
 
    // Initialize loss tracking
@@ -414,7 +473,7 @@ int CountPositions(long magicOffset = -1, int direction = 0)
       if(magicOffset < 0)
       {
          // Count any position belonging to our EA
-         if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+         if(!IsOurMagic(posMagic)) continue;
       }
 
       if(direction > 0 && g_posInfo.PositionType() != POSITION_TYPE_BUY) continue;
@@ -442,7 +501,7 @@ int CountPendings(long magicOffset = -1)
       if(magicOffset >= 0 && ordMagic != InpMagicBase + magicOffset) continue;
       if(magicOffset < 0)
       {
-         if(ordMagic < InpMagicBase || ordMagic > InpMagicBase + 9999) continue;
+         if(!IsOurMagic(ordMagic)) continue;
       }
       count++;
    }
@@ -688,6 +747,53 @@ int DetectSignal()
    return 0;
 }
 
+
+double CountOpenLotsByMagic(long magicOffset)
+{
+   double lots = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!g_posInfo.SelectByIndex(i)) continue;
+      if(g_posInfo.Symbol() != g_symbol) continue;
+      if(g_posInfo.Magic() != InpMagicBase + magicOffset) continue;
+      lots += g_posInfo.Volume();
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!g_ordInfo.SelectByIndex(i)) continue;
+      if(g_ordInfo.Symbol() != g_symbol) continue;
+      if(g_ordInfo.Magic() != InpMagicBase + magicOffset) continue;
+      lots += g_ordInfo.VolumeCurrent();
+   }
+   return lots;
+}
+
+bool ValidatePendingSetup(ENUM_ORDER_TYPE orderType, double openPrice, double slPrice, double tpPrice)
+{
+   double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+   double minDist = g_stopsLevel * g_point;
+
+   if(minDist > 0)
+   {
+      if((orderType == ORDER_TYPE_BUY_LIMIT || orderType == ORDER_TYPE_BUY_STOP)
+         && MathAbs(openPrice - ask) < minDist) return false;
+      if((orderType == ORDER_TYPE_SELL_LIMIT || orderType == ORDER_TYPE_SELL_STOP)
+         && MathAbs(openPrice - bid) < minDist) return false;
+
+      if(slPrice > 0 && MathAbs(openPrice - slPrice) < minDist) return false;
+      if(tpPrice > 0 && MathAbs(openPrice - tpPrice) < minDist) return false;
+   }
+
+   if(orderType == ORDER_TYPE_BUY_LIMIT && openPrice >= ask) return false;
+   if(orderType == ORDER_TYPE_SELL_LIMIT && openPrice <= bid) return false;
+   if(orderType == ORDER_TYPE_BUY_STOP  && openPrice <= ask) return false;
+   if(orderType == ORDER_TYPE_SELL_STOP && openPrice >= bid) return false;
+
+   return true;
+}
+
 //+------------------------------------------------------------------+
 //|                    TRADE EXECUTION HELPERS                         |
 //+------------------------------------------------------------------+
@@ -732,6 +838,7 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
          Print("Trade OK: ", (isBuy?"BUY":"SELL"), " ", lots, " @ ", price,
                " SL=", slPrice, " TP=", tpPrice, " Magic=", InpMagicBase + magicOffset);
          g_lastTradeTime = TimeCurrent();
+         g_lastTradeBarTime = iTime(g_symbol, g_timeframe, 0);
          return true;
       }
       else
@@ -771,19 +878,26 @@ bool PlacePendingOrder(bool isBuyDirection, bool isLimit, double price, double l
    else
       orderType = isLimit ? ORDER_TYPE_SELL_LIMIT : ORDER_TYPE_SELL_STOP;
 
+   if(!ValidatePendingSetup(orderType, price, slPrice, tpPrice))
+   {
+      Print("Pending validation failed: ", EnumToString(orderType), " @ ", price, " SL=", slPrice, " TP=", tpPrice);
+      return false;
+   }
+
    bool result = g_trade.OrderOpen(g_symbol, orderType, lots, 0, price, slPrice, tpPrice,
                                     ORDER_TIME_GTC, 0, fullComment);
 
-   if(result && g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
+   uint rc = g_trade.ResultRetcode();
+   if(result && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
    {
       Print("Pending OK: ", EnumToString(orderType), " ", lots, " @ ", price, " Magic=", InpMagicBase + magicOffset);
+      g_lastTradeTime = TimeCurrent();
+      g_lastTradeBarTime = iTime(g_symbol, g_timeframe, 0);
       return true;
    }
-   else
-   {
-      Print("Pending failed: ", g_trade.ResultRetcodeDescription());
-      return false;
-   }
+
+   Print("Pending failed: ", g_trade.ResultRetcodeDescription(), " Code:", rc);
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -847,10 +961,10 @@ void PlaceReversalEntries()
       double beyondDist = PriceToPips(MathAbs(currentPrice - g_lastTPHitPrice));
       triggerOK = (beyondDist >= InpReversal_BeyondTP_Pips);
    }
-   else // Both required
+   else // Both required: TP event + beyond TP distance
    {
       double beyondDist = PriceToPips(MathAbs(currentPrice - g_lastTPHitPrice));
-      triggerOK = (beyondDist >= InpReversal_BeyondTP_Pips);
+      triggerOK = (g_lastTPHitTime > 0 && beyondDist >= InpReversal_BeyondTP_Pips);
    }
 
    if(!triggerOK) return;
@@ -869,7 +983,11 @@ void PlaceReversalEntries()
    bool pullbackDetected = false;
    if(InpReversal_PullbackMode == PB_PipsFromPeak)
    {
-      double pullback = PriceToPips(MathAbs(currentPrice - g_peakAfterTP));
+      double pullback = 0;
+      if(g_lastTPHitDirection > 0)
+         pullback = PriceToPips(g_peakAfterTP - currentPrice);
+      else
+         pullback = PriceToPips(currentPrice - g_peakAfterTP);
       pullbackDetected = (pullback >= InpReversal_PullbackPips);
    }
    else if(InpReversal_PullbackMode == PB_OppositeSignal)
@@ -947,12 +1065,19 @@ void PlaceGridOrdersOriginal(int signal)
 
    if(CountAllEAPositions() >= InpMaxPositionsTotal) return;
    if(CountPendings() >= InpMaxPendingsTotal) return;
+   if(TimeCurrent() - g_lastTradeTime < InpSys1_MinSecBetween) return;
 
    bool isBuy = (g_gridDirection > 0);
+   if(!InpAllowOppositeDirection)
+   {
+      if(isBuy && CountPositions(-1, -1) > 0) return;
+      if(!isBuy && CountPositions(-1, +1) > 0) return;
+   }
    double basePrice = isBuy ? SymbolInfoDouble(g_symbol, SYMBOL_ASK) : SymbolInfoDouble(g_symbol, SYMBOL_BID);
    double baseLots = CalculateLotSize(InpOriginal_SL_Pips);
    double totalLots = 0;
    long baseMagic = isBuy ? MAGIC_GRID_ORIG_BUY : MAGIC_GRID_ORIG_SELL;
+   double existingLots = CountOpenLotsByMagic(baseMagic);
 
    int existingGrid = CountPositions(baseMagic) + CountPendings(baseMagic);
 
@@ -966,7 +1091,7 @@ void PlaceGridOrdersOriginal(int signal)
 
       levelLots = NormalizeLots(levelLots);
       totalLots += levelLots;
-      if(totalLots > InpGrid_MaxTotalLots) break;
+      if(existingLots + totalLots > InpGrid_MaxTotalLots) break;
 
       if(level == 0 && InpGrid_Mode == GRID_MarketPlusPending)
       {
@@ -981,10 +1106,20 @@ void PlaceGridOrdersOriginal(int signal)
          double orderPrice;
          bool isLimit = (InpGrid_OrderType == GRID_Limits);
 
-         if(isBuy)
-            orderPrice = basePrice - stepPrice; // limits below for buy
+         if(isLimit)
+         {
+            if(isBuy)
+               orderPrice = basePrice - stepPrice;
+            else
+               orderPrice = basePrice + stepPrice;
+         }
          else
-            orderPrice = basePrice + stepPrice; // limits above for sell
+         {
+            if(isBuy)
+               orderPrice = basePrice + stepPrice;
+            else
+               orderPrice = basePrice - stepPrice;
+         }
 
          if(orderPrice <= 0) continue;
 
@@ -1005,10 +1140,19 @@ void PlaceGridOrdersReversal()
    if(TimeCurrent() - g_lastTPHitTime > InpReversal_MaxSecsAfterTP) return;
 
    bool isBuy = (g_lastTPHitDirection < 0); // opposite
+   if(!InpAllowOppositeDirection)
+   {
+      if(isBuy && CountPositions(-1, -1) > 0) return;
+      if(!isBuy && CountPositions(-1, +1) > 0) return;
+   }
+
+   if(TimeCurrent() - g_lastTradeTime < InpSys1_MinSecBetween) return;
+
    double basePrice = isBuy ? SymbolInfoDouble(g_symbol, SYMBOL_ASK) : SymbolInfoDouble(g_symbol, SYMBOL_BID);
    double baseLots = CalculateLotSize(InpReversal_SL_Pips);
    double totalLots = 0;
    long baseMagic = isBuy ? MAGIC_GRID_REV_BUY : MAGIC_GRID_REV_SELL;
+   double existingLots = CountOpenLotsByMagic(baseMagic);
 
    int existingGrid = CountPositions(baseMagic) + CountPendings(baseMagic);
    if(existingGrid >= InpGrid_MaxOrders) return;
@@ -1023,7 +1167,7 @@ void PlaceGridOrdersReversal()
 
       levelLots = NormalizeLots(levelLots);
       totalLots += levelLots;
-      if(totalLots > InpGrid_MaxTotalLots) break;
+      if(existingLots + totalLots > InpGrid_MaxTotalLots) break;
 
       if(level == 0 && InpGrid_Mode == GRID_MarketPlusPending)
       {
@@ -1036,10 +1180,20 @@ void PlaceGridOrdersReversal()
          double orderPrice;
          bool isLimit = (InpGrid_OrderType == GRID_Limits);
 
-         if(isBuy)
-            orderPrice = basePrice - stepPrice;
+         if(isLimit)
+         {
+            if(isBuy)
+               orderPrice = basePrice - stepPrice;
+            else
+               orderPrice = basePrice + stepPrice;
+         }
          else
-            orderPrice = basePrice + stepPrice;
+         {
+            if(isBuy)
+               orderPrice = basePrice + stepPrice;
+            else
+               orderPrice = basePrice - stepPrice;
+         }
 
          if(orderPrice <= 0) continue;
 
@@ -1093,30 +1247,59 @@ bool ClosePositionPartial(long ticket, double closePct)
    if(!PositionSelectByTicket(ticket)) return false;
 
    double volume = PositionGetDouble(POSITION_VOLUME);
-   double closeVol = NormalizeLots(volume * closePct / 100.0);
+   double minLot = (InpMinLot > 0) ? InpMinLot : g_lotMin;
 
-   if(closeVol < g_lotMin) return false;
-   if(closeVol >= volume) closeVol = NormalizeLots(volume - g_lotMin);
-   if(closeVol < g_lotMin) return false;
+   double closeVolRaw = volume * closePct / 100.0;
+   double closeVol = NormalizeLots(closeVolRaw);
+
+   if(closeVol < minLot) return false;
+   if(closeVol >= volume)
+   {
+      double remainCandidate = NormalizeLots(volume - minLot);
+      closeVol = remainCandidate;
+   }
+
+   double remainVol = NormalizeLots(volume - closeVol);
+   if(remainVol > 0 && remainVol < minLot)
+      closeVol = NormalizeLots(volume - minLot);
+
+   remainVol = NormalizeLots(volume - closeVol);
+   if(closeVol < minLot) return false;
+   if(remainVol > 0 && remainVol < minLot) return false;
 
    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    double price = (posType == POSITION_TYPE_BUY) ?
       SymbolInfoDouble(g_symbol, SYMBOL_BID) : SymbolInfoDouble(g_symbol, SYMBOL_ASK);
 
-   g_trade.SetExpertMagicNumber((ulong)PositionGetInteger(POSITION_MAGIC));
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+   ZeroMemory(req);
+   ZeroMemory(res);
 
-   bool result = false;
-   if(posType == POSITION_TYPE_BUY)
-      result = g_trade.Sell(closeVol, g_symbol, price, 0, 0, InpTradeCommentPrefix + "_Partial");
-   else
-      result = g_trade.Buy(closeVol, g_symbol, price, 0, 0, InpTradeCommentPrefix + "_Partial");
+   req.action    = TRADE_ACTION_DEAL;
+   req.symbol    = g_symbol;
+   req.position  = ticket;
+   req.magic     = (ulong)PositionGetInteger(POSITION_MAGIC);
+   req.volume    = closeVol;
+   req.price     = price;
+   req.deviation = InpSlippagePoints;
+   req.type      = (posType == POSITION_TYPE_BUY) ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   req.comment   = InpTradeCommentPrefix + "_Partial";
 
-   if(result)
+   if(!OrderSend(req, res))
+   {
+      Print("Partial close FAILED(OrderSend): ticket=", ticket, " code=", res.retcode);
+      return false;
+   }
+
+   if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
+   {
       Print("Partial close OK: ticket=", ticket, " closed=", closeVol, " of ", volume);
-   else
-      Print("Partial close FAILED: ", g_trade.ResultRetcodeDescription());
+      return true;
+   }
 
-   return result;
+   Print("Partial close FAILED: retcode=", res.retcode, " ", res.comment);
+   return false;
 }
 
 void MoveSLToBreakeven(long ticket)
@@ -1165,7 +1348,7 @@ void ManageExitSystem2_Partials()
       if(g_posInfo.Symbol() != g_symbol) continue;
 
       long posMagic = g_posInfo.Magic();
-      if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(posMagic)) continue;
 
       long ticket = g_posInfo.Ticket();
       if(IsTicketPartialClosed(ticket)) continue;
@@ -1239,7 +1422,7 @@ void CloseAllEAPositions()
       if(g_posInfo.Symbol() != g_symbol) continue;
 
       long posMagic = g_posInfo.Magic();
-      if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(posMagic)) continue;
 
       g_trade.SetExpertMagicNumber((ulong)posMagic);
       if(!g_trade.PositionClose(g_posInfo.Ticket()))
@@ -1255,7 +1438,7 @@ void CancelAllEAPendings()
       if(g_ordInfo.Symbol() != g_symbol) continue;
 
       long ordMagic = g_ordInfo.Magic();
-      if(ordMagic < InpMagicBase || ordMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(ordMagic)) continue;
 
       if(!g_trade.OrderDelete(g_ordInfo.Ticket()))
          Print("Cancel pending failed: ticket=", g_ordInfo.Ticket(), " ", g_trade.ResultRetcodeDescription());
@@ -1277,7 +1460,7 @@ double CalculatePortfolioProfitPips()
       if(g_posInfo.Symbol() != g_symbol) continue;
 
       long posMagic = g_posInfo.Magic();
-      if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(posMagic)) continue;
 
       double entry = g_posInfo.PriceOpen();
       double current = g_posInfo.PriceCurrent();
@@ -1303,17 +1486,19 @@ double CalculatePortfolioProfitMoney()
       if(g_posInfo.Symbol() != g_symbol) continue;
 
       long posMagic = g_posInfo.Magic();
-      if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(posMagic)) continue;
 
       total += g_posInfo.Profit() + g_posInfo.Swap() + g_posInfo.Commission();
    }
    return total;
 }
 
-double CalculateWeightedAverageSL()
+double CalculateAverageSLPrice()
 {
    double totalWeightedSL = 0;
    double totalLots = 0;
+   double totalSimple = 0;
+   int cnt = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -1321,7 +1506,7 @@ double CalculateWeightedAverageSL()
       if(g_posInfo.Symbol() != g_symbol) continue;
 
       long posMagic = g_posInfo.Magic();
-      if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(posMagic)) continue;
 
       double vol = g_posInfo.Volume();
       double entry = g_posInfo.PriceOpen();
@@ -1335,9 +1520,13 @@ double CalculateWeightedAverageSL()
 
       totalWeightedSL += slPrice * vol;
       totalLots += vol;
+      totalSimple += slPrice;
+      cnt++;
    }
 
-   if(totalLots == 0) return 0;
+   if(cnt == 0 || totalLots <= 0) return 0;
+   if(InpExit3_AvgSLDef == E3_SimpleAvg)
+      return totalSimple / cnt;
    return totalWeightedSL / totalLots;
 }
 
@@ -1349,7 +1538,7 @@ void PortfolioPartialCloseAll(double closePct)
       if(g_posInfo.Symbol() != g_symbol) continue;
 
       long posMagic = g_posInfo.Magic();
-      if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+      if(!IsOurMagic(posMagic)) continue;
 
       ClosePositionPartial(g_posInfo.Ticket(), closePct);
    }
@@ -1364,6 +1553,7 @@ void ManageExitSystem3_Portfolio()
       {
          g_state = STATE_CoolingDown;
          g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+         ResetCycleTracking();
       }
       return;
    }
@@ -1381,8 +1571,7 @@ void ManageExitSystem3_Portfolio()
       CloseAllEAOrdersAndPositions();
       g_state = STATE_CoolingDown;
       g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
-      g_portfolioPartialProfitDone = false;
-      g_portfolioPartialLossDone = false;
+      ResetCycleTracking();
       return;
    }
 
@@ -1403,41 +1592,44 @@ void ManageExitSystem3_Portfolio()
                if(!g_posInfo.SelectByIndex(i)) continue;
                if(g_posInfo.Symbol() != g_symbol) continue;
                long posMagic = g_posInfo.Magic();
-               if(posMagic < InpMagicBase || posMagic > InpMagicBase + 9999) continue;
+               if(!IsOurMagic(posMagic)) continue;
                MoveSLToBreakeven(g_posInfo.Ticket());
             }
          }
       }
    }
 
-   // AVERAGE SL CHECK
+   double portfolioLoss = 0;
+   if(InpExit3_ProfitMode == E3_Money)
+      portfolioLoss = -CalculatePortfolioProfitMoney();
+   else
+      portfolioLoss = -CalculatePortfolioProfitPips();
+
    if(InpExit3_SLMode == E3_AverageSL)
    {
-      double portfolioLoss = 0;
-      if(InpExit3_ProfitMode == E3_Money)
-         portfolioLoss = -CalculatePortfolioProfitMoney();
-      else
-         portfolioLoss = -CalculatePortfolioProfitPips();
+      double avgSL = CalculateAverageSLPrice();
+      if(avgSL > 0)
+         Print("Average SL reference (", EnumToString(InpExit3_AvgSLDef), ")=", avgSL);
+   }
 
-      if(portfolioLoss >= InpExit3_SLValue)
-      {
-         Print("Portfolio SL hit! Loss=", portfolioLoss, " Limit=", InpExit3_SLValue);
-         CloseAllEAOrdersAndPositions();
-         g_state = STATE_CoolingDown;
-         g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
-         return;
-      }
+   if(portfolioLoss >= InpExit3_SLValue)
+   {
+      Print("Portfolio SL hit! Loss=", portfolioLoss, " Limit=", InpExit3_SLValue);
+      CloseAllEAOrdersAndPositions();
+      g_state = STATE_CoolingDown;
+      g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+      ResetCycleTracking();
+      return;
+   }
 
-      // PORTFOLIO PARTIAL LOSS
-      if(InpExit3_EnablePartialLoss && !g_portfolioPartialLossDone)
+   if(InpExit3_EnablePartialLoss && !g_portfolioPartialLossDone)
+   {
+      double lossTrigger = InpExit3_SLValue * InpExit3_PartialLossTrigPct / 100.0;
+      if(portfolioLoss >= lossTrigger)
       {
-         double lossTrigger = InpExit3_SLValue * InpExit3_PartialLossTrigPct / 100.0;
-         if(portfolioLoss >= lossTrigger)
-         {
-            Print("Portfolio partial loss trigger at ", portfolioLoss);
-            PortfolioPartialCloseAll(InpExit3_PartialLossClosePct);
-            g_portfolioPartialLossDone = true;
-         }
+         Print("Portfolio partial loss trigger at ", portfolioLoss);
+         PortfolioPartialCloseAll(InpExit3_PartialLossClosePct);
+         g_portfolioPartialLossDone = true;
       }
    }
 }
@@ -1454,12 +1646,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    {
       if(trans.symbol != g_symbol) return;
 
+      if(trans.deal <= 0) return;
+      if(!HistoryDealSelect(trans.deal)) return;
+
       // Check if it's a closing deal (entry type OUT)
       ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
       if(dealEntry != DEAL_ENTRY_OUT) return;
 
       long dealMagic = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
-      if(dealMagic < InpMagicBase || dealMagic > InpMagicBase + 9999) return;
+      if(!IsOurMagic(dealMagic)) return;
 
       double dealProfit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
       ENUM_DEAL_REASON reason = (ENUM_DEAL_REASON)HistoryDealGetInteger(trans.deal, DEAL_REASON);
@@ -1493,6 +1688,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          {
             g_state = STATE_CoolingDown;
             g_cooldownUntil = TimeCurrent() + InpCooldownSecondsAfterTrade;
+            ResetCycleTracking();
          }
 
          // Reset grid state
@@ -1531,10 +1727,20 @@ void RunStateMachine(int signal)
          else
             PlaceGridOrdersOriginal(signal);
 
-         if(CountAllEAPositions() > 0)
-            g_state = STATE_OriginalPositionsRunning;
+         if(InpEntrySystemMode == ENTRY_System2_GridReversal)
+         {
+            if(CountAllEAPositions() + CountPendings() > 0)
+               g_state = STATE_OriginalPositionsRunning;
+            else
+               g_state = STATE_Idle;
+         }
          else
-            g_state = STATE_Idle;
+         {
+            if(CountAllEAPositions() > 0)
+               g_state = STATE_OriginalPositionsRunning;
+            else
+               g_state = STATE_Idle;
+         }
          break;
       }
 
@@ -1605,11 +1811,7 @@ void RunStateMachine(int signal)
          if(TimeCurrent() >= g_cooldownUntil)
          {
             g_state = STATE_Idle;
-            g_portfolioPartialProfitDone = false;
-            g_portfolioPartialLossDone = false;
-            // Clean partial tracking
-            g_partialClosedCount = 0;
-            ArrayResize(g_partialClosedTickets, 0);
+            ResetCycleTracking();
          }
          break;
       }
@@ -1649,18 +1851,14 @@ void OnTick()
       }
    }
 
-   // One trade per bar check
-   if(InpOneTradePerBar)
+   // One trade per bar check (only blocks after an actual trade this bar)
+   datetime barTime = iTime(g_symbol, g_timeframe, 0);
+   if(InpOneTradePerBar && g_state == STATE_Idle && g_lastTradeBarTime == barTime)
    {
-      datetime barTime = iTime(g_symbol, g_timeframe, 0);
-      if(barTime == g_lastBarTime && g_state == STATE_Idle)
-      {
-         ManageExits();
-         return;
-      }
-      if(barTime != g_lastBarTime)
-         g_lastBarTime = barTime;
+      ManageExits();
+      return;
    }
+   g_lastBarTime = barTime;
 
    // Detect signal
    int signal = 0;
