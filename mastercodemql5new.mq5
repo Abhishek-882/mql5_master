@@ -101,6 +101,14 @@ enum ENUM_SIGNAL_TYPE
    SIG_OncePerBar = 1  // Once Per Bar
 };
 
+enum ENUM_BACKTEST_BYPASS_DIRECTION
+{
+   BYPASS_Alternate = 0,
+   BYPASS_BuyOnly   = 1,
+   BYPASS_SellOnly  = 2,
+   BYPASS_Candle1   = 3
+};
+
 //+------------------------------------------------------------------+
 //|                     STATE MACHINE ENUM                            |
 //+------------------------------------------------------------------+
@@ -130,6 +138,17 @@ input int      InpSlippagePoints        = 10;          // Slippage/Deviation Poi
 input bool     InpOneTradePerBar        = true;        // One Trade Per Bar
 input int      InpCooldownSecondsAfterTrade = 60;      // Cooldown Seconds After Trade
 input bool     InpAllowOppositeDirection = true;       // Allow Opposite Direction Positions
+
+
+//--- BACKTEST BYPASS (for tester validation)
+input bool     InpEnableBacktestBypassSystem = false; // Backtest bypass: ignore normal signal/filter/state flow
+input ENUM_BACKTEST_BYPASS_DIRECTION InpBypassDirection = BYPASS_Alternate; // Backtest bypass direction mode
+input bool     InpBypassNewBarOnly    = true;         // Backtest bypass: place at most once per new bar
+input bool     InpBypassCloseBeforeEntry = false;     // Backtest bypass: close all EA positions before opening new one
+input int      InpBypassMinSecBetween = 0;            // Backtest bypass: minimum seconds between entries
+input double   InpBypassFixedLot      = 0.10;         // Backtest bypass fixed lot size
+input double   InpBypassTP_Pips       = 120.0;        // Backtest bypass TP (pips)
+input double   InpBypassSL_Pips       = 120.0;        // Backtest bypass SL (pips)
 
 //--- SIGNAL (Ported from original EA)
 input double   InpTimeBombUpPips        = 8.0;         // TimeBomb Up: Pips Threshold (XAUUSD M1 production)
@@ -358,6 +377,7 @@ bool           g_effRequireTBHistoryBeforeFallback = true;
 int            g_effCooldownSecondsAfterTrade = 0;
 int            g_effSys1MinSecBetween = 0;
 bool           g_tickFreqBarFallbackActive = false;
+int            g_bypassLastDirection = -1;
 int            g_conflictsTotal = 0;
 int            g_conflictsDiscardedBuy = 0;
 int            g_conflictsDiscardedSell = 0;
@@ -399,12 +419,15 @@ double EstimateAtrPips(int lookbackBars);
 void LogSignalConfigRiskAtStartup();
 void EvaluateTickFrequencyGuard(bool isNewBar);
 void ResetGridActivationState(string reasonCode);
+bool RunBacktestBypassSystem(bool isNewBar);
 
 bool ValidateInputs()
 {
    if(InpMagicBase < 1) return false;
    if(InpSlippagePoints < 0) return false;
    if(InpCooldownSecondsAfterTrade < 0) return false;
+   if(InpBypassMinSecBetween < 0 || InpBypassFixedLot <= 0) return false;
+   if(InpBypassTP_Pips < 0 || InpBypassSL_Pips < 0) return false;
 
    if(InpTimeBombUpPips < 0 || InpTimeBombDownPips < 0) return false;
    if(InpTimeBombUpSeconds <= 0 || InpTimeBombDownSeconds <= 0) return false;
@@ -744,6 +767,8 @@ int OnInit()
    Print("=== Master Trader V2.0 Initialized ===");
    Print("Symbol: ", g_symbol, " TF: ", EnumToString(g_timeframe));
    Print("Entry System: ", EnumToString(InpEntrySystemMode));
+   Print("Backtest bypass system: ", (InpEnableBacktestBypassSystem ? "ENABLED" : "OFF"),
+         " mode=", EnumToString(InpBypassDirection));
    Print("Exit System: ", EnumToString(InpExitSystemMode));
    Print("Pip Value Points: ", g_pipValue);
    Print("Signal Profile: ", (InpUseOriginalSignalProfile ? "Original-Compatible" : "Advanced/Custom"),
@@ -2557,11 +2582,72 @@ void RunStateMachine(int signal)
    }
 }
 
+bool RunBacktestBypassSystem(bool isNewBar)
+{
+   if(!InpEnableBacktestBypassSystem)
+      return false;
+
+   if(InpBypassNewBarOnly && !isNewBar)
+      return true;
+
+   if(InpBypassMinSecBetween > 0 && (TimeCurrent() - g_lastTradeTime) < InpBypassMinSecBetween)
+      return true;
+
+   int signal = +1;
+   if(InpBypassDirection == BYPASS_BuyOnly)
+      signal = +1;
+   else if(InpBypassDirection == BYPASS_SellOnly)
+      signal = -1;
+   else if(InpBypassDirection == BYPASS_Candle1)
+   {
+      double c1 = iClose(g_symbol, g_timeframe, 1);
+      double o1 = iOpen(g_symbol, g_timeframe, 1);
+      signal = (c1 >= o1) ? +1 : -1;
+   }
+   else
+   {
+      g_bypassLastDirection = -g_bypassLastDirection;
+      signal = (g_bypassLastDirection == 0) ? +1 : g_bypassLastDirection;
+   }
+
+   if(InpBypassCloseBeforeEntry)
+      CloseAllEAOrdersAndPositions();
+
+   double lots = NormalizeLots(InpBypassFixedLot);
+   if(lots <= 0)
+   {
+      Print("Backtest bypass: invalid lot after normalization. requested=", InpBypassFixedLot);
+      return true;
+   }
+
+   bool isBuy = (signal > 0);
+   long magicOff = isBuy ? MAGIC_ORIGINAL_SINGLE_BUY : MAGIC_ORIGINAL_SINGLE_SELL;
+   string tag = isBuy ? "BypassBuy" : "BypassSell";
+
+   bool placed = ExecuteTradeWithRetry(isBuy, lots, InpBypassSL_Pips, InpBypassTP_Pips, magicOff, tag, 1);
+   Print("Backtest bypass tick: isNewBar=", (isNewBar ? "Y" : "N"),
+         " dir=", (isBuy ? "BUY" : "SELL"),
+         " lots=", DoubleToString(lots, 2),
+         " placed=", (placed ? "Y" : "N"));
+
+   return true;
+}
+
 //+------------------------------------------------------------------+
 //|                         MAIN OnTick                                |
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   datetime bypassBarTime = iTime(g_symbol, g_timeframe, 0);
+   bool bypassIsNewBar = (bypassBarTime != g_lastBarTime);
+   if(InpEnableBacktestBypassSystem)
+   {
+      g_lastBarTime = bypassBarTime;
+      RunBacktestBypassSystem(bypassIsNewBar);
+      ManageExits();
+      return;
+   }
+
    // Pre-checks
    if(IsDailyLossLimitHit())
    {
