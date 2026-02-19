@@ -130,7 +130,7 @@ enum ENUM_EA_STATE
 //--- GENERAL
 input string   InpSymbol                = "";          // Symbol (empty=current)
 input ENUM_TIMEFRAMES InpTimeframe      = PERIOD_CURRENT; // Timeframe
-input long     InpMagicBase             = 10000;       // Magic Number Base
+input long     InpMagicBase             = 5547;        // Magic Number Base (original-compatible default)
 input string   InpTradeCommentPrefix    = "MTV2";      // Trade Comment Prefix
 input bool     InpMaxSpreadFilterEnabled = false;      // Enable Max Spread Filter (default OFF)
 input int      InpMaxSpreadPoints       = 50;          // Max Spread Points (if filter ON)
@@ -151,14 +151,14 @@ input double   InpBypassTP_Pips       = 120.0;        // Backtest bypass TP (pip
 input double   InpBypassSL_Pips       = 120.0;        // Backtest bypass SL (pips)
 
 //--- SIGNAL (Ported from original EA)
-input double   InpTimeBombUpPips        = 8.0;         // TimeBomb Up: Pips Threshold (XAUUSD M1 production)
-input double   InpTimeBombUpSeconds     = 8.0;         // TimeBomb Up: Time Window (seconds)
-input double   InpTimeBombDownPips      = 8.0;         // TimeBomb Down: Pips Threshold (XAUUSD M1 production)
-input double   InpTimeBombDownSeconds   = 8.0;         // TimeBomb Down: Time Window (seconds)
+input double   InpTimeBombUpPips        = 200.0;       // TimeBomb Up: Pips Threshold (Master-Trader default)
+input double   InpTimeBombUpSeconds     = 3.0;         // TimeBomb Up: Time Window (seconds, Master-Trader default)
+input double   InpTimeBombDownPips      = 200.0;       // TimeBomb Down: Pips Threshold (Master-Trader default)
+input double   InpTimeBombDownSeconds   = 3.0;         // TimeBomb Down: Time Window (seconds, Master-Trader default)
 input ENUM_SIGNAL_TYPE InpSignalType    = SIG_Continuous; // Signal Type
 input int      InpImpulseQuietBars      = 3;           // Impulse: Quiet Bars Count
-input double   InpImpulseQuietMinRange  = 1.0;         // Impulse: Quiet Bars Min Range (pips)
-input double   InpImpulseStrength       = 1.2;         // Impulse: Strength Multiplier
+input double   InpImpulseQuietMinRange  = 5.0;         // Impulse: Quiet Bars Min Range (pips, Master-Trader default)
+input double   InpImpulseStrength       = 3.0;         // Impulse: Strength Multiplier (Master-Trader default)
 input int      InpImpulseShift          = 0;           // Impulse: Bar Shift
 input int      InpSignalConfirmWindowSec = 8;          // Signal: TB/Impulse confirm window (sec)
 input int      InpSignalConfirmWindowBars = 3;         // Signal: TB/Impulse confirm window (bars)
@@ -170,6 +170,10 @@ input int      InpFallbackStartupGraceSec  = 120;      // Signal fallback: start
 input int      InpFallbackForceAfterBarsNoTB = 45;     // Signal fallback: force allow after bars with no TB history
 input bool     InpUseOriginalSignalProfile = false;    // Signal: use original-compatible profile defaults
 input bool     InpUseXAUUSDM1ProductionPreset = false; // Signal: apply XAUUSD M1 production preset defaults (recommended only for XAUUSD M1)
+input bool     InpStrictOriginalSignalChain = false;   // Compatibility: strict original signal chain (TB->Impulse direct, no buffered arbitration)
+input bool     InpStrictOriginalExecutionMode = false; // Compatibility: strict original execution cadence/path (no state-machine throttles)
+input bool     InpUseOriginalStyleComments = true;     // Compatibility: use original-style minimal comments for orders
+input bool     InpMinimizeExecutionTransformsInCompat = true; // Compatibility: minimize retries/transformations unless broker constraints require
 input bool     InpWarnStrictSignalConfigAtStartup = true; // Signal: startup strict/high-risk config warning
 input int      InpSignalAtrLookbackBars = 14;          // Signal diagnostics: ATR lookback bars
 input double   InpStrictTbAtrRatio = 2.5;              // Strict if TB pips > ATR*preset ratio
@@ -274,8 +278,8 @@ input double   InpExit3_PartialLossClosePct = 50.0;    // Exit3: Partial Loss Cl
 //+------------------------------------------------------------------+
 //|                      MAGIC NUMBER OFFSETS                          |
 //+------------------------------------------------------------------+
-#define MAGIC_ORIGINAL_SINGLE_BUY   1001
-#define MAGIC_ORIGINAL_SINGLE_SELL  1002
+#define MAGIC_ORIGINAL_SINGLE_BUY   17
+#define MAGIC_ORIGINAL_SINGLE_SELL  18
 #define MAGIC_REVERSAL_SINGLE_BUY   1003
 #define MAGIC_REVERSAL_SINGLE_SELL  1004
 #define MAGIC_GRID_ORIG_BUY         2001
@@ -418,6 +422,46 @@ void LogSignalConfigRiskAtStartup();
 void EvaluateTickFrequencyGuard(bool isNewBar);
 void ResetGridActivationState(string reasonCode);
 bool RunBacktestBypassSystem(bool isNewBar, int signal);
+bool IsStrictOriginalSignalMode();
+bool IsStrictOriginalExecutionMode();
+bool IsOriginalCompatibilityMode();
+string ComposeTradeComment(string compatTag, string defaultTag);
+void LogExecutionRequest(string phase, bool isBuy, double lots, double slPips, double tpPips, long magicOffset, string comment, double slPrice, double tpPrice);
+int DetectSignalStrictOriginalChain();
+
+bool IsStrictOriginalSignalMode()
+{
+   return (InpUseOriginalSignalProfile && InpStrictOriginalSignalChain);
+}
+
+bool IsStrictOriginalExecutionMode()
+{
+   return (InpUseOriginalSignalProfile && InpStrictOriginalExecutionMode);
+}
+
+bool IsOriginalCompatibilityMode()
+{
+   return InpUseOriginalSignalProfile;
+}
+
+string ComposeTradeComment(string compatTag, string defaultTag)
+{
+   if(IsOriginalCompatibilityMode() && InpUseOriginalStyleComments)
+      return compatTag;
+   return InpTradeCommentPrefix + "_" + defaultTag;
+}
+
+void LogExecutionRequest(string phase, bool isBuy, double lots, double slPips, double tpPips, long magicOffset, string comment, double slPrice, double tpPrice)
+{
+   Print("Execution ", phase, ": dir=", (isBuy ? "BUY" : "SELL"),
+         " lots=", DoubleToString(lots, 2),
+         " slPips=", DoubleToString(slPips, 2),
+         " tpPips=", DoubleToString(tpPips, 2),
+         " SL=", DoubleToString(slPrice, g_digits),
+         " TP=", DoubleToString(tpPrice, g_digits),
+         " magic=", InpMagicBase + magicOffset,
+         " comment='", comment, "'");
+}
 
 bool ValidateInputs()
 {
@@ -715,9 +759,30 @@ int OnInit()
    bool xauSymbolOk = IsXauUsdLikeSymbol(g_symbol);
    bool xauTfOk = (g_timeframe == PERIOD_M1);
 
+   if(InpUseOriginalSignalProfile)
+   {
+      g_effTimeBombUpPips = 200.0;
+      g_effTimeBombDownPips = 200.0;
+      g_effTimeBombUpSeconds = 3.0;
+      g_effTimeBombDownSeconds = 3.0;
+      g_effImpulseQuietBars = 3;
+      g_effImpulseStrength = 3.0;
+      g_effSignalConfirmWindowSec = 0;
+      g_effSignalConfirmWindowBars = 0;
+      g_effAllowImpulseOnlyFallback = false;
+      g_effImpulseOnlyFallbackBars = MathMax(1, InpImpulseOnlyFallbackBars);
+      g_effRequireTBHistoryBeforeFallback = true;
+      g_effCooldownSecondsAfterTrade = InpCooldownSecondsAfterTrade;
+      g_effSys1MinSecBetween = InpSys1_MinSecBetween;
+   }
+
    if(xauPresetRequested)
    {
-      if(xauSymbolOk && xauTfOk)
+      if(InpUseOriginalSignalProfile)
+      {
+         Print("NOTE: XAUUSD M1 production preset requested but bypassed because original-compatible profile is enabled.");
+      }
+      else if(xauSymbolOk && xauTfOk)
       {
          g_effTimeBombUpPips = 8.0;
          g_effTimeBombDownPips = 8.0;
@@ -742,23 +807,6 @@ int OnInit()
       }
    }
 
-   if(InpUseOriginalSignalProfile)
-   {
-      g_effTimeBombUpPips = 30.0;
-      g_effTimeBombDownPips = 30.0;
-      g_effTimeBombUpSeconds = 5.0;
-      g_effTimeBombDownSeconds = 5.0;
-      g_effImpulseQuietBars = 2;
-      g_effImpulseStrength = 1.2;
-      g_effSignalConfirmWindowSec = 5;
-      g_effSignalConfirmWindowBars = 1;
-      g_effAllowImpulseOnlyFallback = false;
-      g_effImpulseOnlyFallbackBars = MathMax(5, InpImpulseOnlyFallbackBars);
-      g_effRequireTBHistoryBeforeFallback = true;
-      g_effCooldownSecondsAfterTrade = MathMin(InpCooldownSecondsAfterTrade, 5);
-      g_effSys1MinSecBetween = MathMin(InpSys1_MinSecBetween, 1);
-   }
-
    g_eaInitTime = iTime(g_symbol, g_timeframe, 0);
    g_eaInitTickTime = TimeCurrent();
 
@@ -770,6 +818,8 @@ int OnInit()
    Print("Exit System: ", EnumToString(InpExitSystemMode));
    Print("Pip Value Points: ", g_pipValue);
    Print("Signal Profile: ", (InpUseOriginalSignalProfile ? "Original-Compatible" : "Advanced/Custom"),
+         " strictSignalChain=", (IsStrictOriginalSignalMode() ? "Y" : "N"),
+         " strictExecution=", (IsStrictOriginalExecutionMode() ? "Y" : "N"),
          " xauPresetRequested=", (xauPresetRequested ? "Y" : "N"),
          " xauPresetApplied=", (xauPresetApplied ? "Y" : "N"),
          " tickGuardEnabled=", (InpEnableTickFreqGuard ? "Y" : "N"));
@@ -784,6 +834,11 @@ int OnInit()
          " requireTBHistoryFallback=", (g_effRequireTBHistoryBeforeFallback ? "ON" : "OFF"),
          " cooldownSec=", g_effCooldownSecondsAfterTrade,
          " minSecBetween=", g_effSys1MinSecBetween);
+   Print("Compatibility metadata: magicBase=", InpMagicBase,
+         " buyMagic=", InpMagicBase + MAGIC_ORIGINAL_SINGLE_BUY,
+         " sellMagic=", InpMagicBase + MAGIC_ORIGINAL_SINGLE_SELL,
+         " commentBuy='", ComposeTradeComment("17", "OrigBuy"),
+         "' commentSell='", ComposeTradeComment("18", "OrigSell"), "'");
    LogSignalConfigRiskAtStartup();
    Print("======================================");
 
@@ -1372,6 +1427,22 @@ void LogNoSignalDiagnostics(bool isSignalEvaluationActive)
          " fallbackEligible(up/dn)=", (fallbackEligibleUp ? "Y" : "N"), "/", (fallbackEligibleDn ? "Y" : "N"));
 }
 
+int DetectSignalStrictOriginalChain()
+{
+   bool buySignal = (DetectTimeBombUp() && DetectImpulseUp());
+   bool sellSignal = (DetectTimeBombDown() && DetectImpulseDown());
+
+   if(buySignal && sellSignal)
+      Print("Strict original chain: BUY and SELL both valid on this tick (no conflict arbitration applied).");
+
+   if(buySignal)
+      return +1;
+   if(sellSignal)
+      return -1;
+
+   return 0;
+}
+
 int DetectSignal()
 {
    int signal = 0;
@@ -1523,7 +1594,11 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
 {
    g_trade.SetExpertMagicNumber((ulong)(InpMagicBase + magicOffset));
 
-   for(int attempt = 0; attempt < maxRetries; attempt++)
+   int effectiveRetries = maxRetries;
+   if(IsOriginalCompatibilityMode() && InpMinimizeExecutionTransformsInCompat)
+      effectiveRetries = 1;
+
+   for(int attempt = 0; attempt < effectiveRetries; attempt++)
    {
       double price = isBuy ? SymbolInfoDouble(g_symbol, SYMBOL_ASK) : SymbolInfoDouble(g_symbol, SYMBOL_BID);
       double slPrice = 0, tpPrice = 0;
@@ -1547,8 +1622,9 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
             tpPrice = isBuy ? NormalizePrice(price + minDist) : NormalizePrice(price - minDist);
       }
 
-      string fullComment = InpTradeCommentPrefix + "_" + comment;
+      string fullComment = ComposeTradeComment(comment, comment);
       bool result = false;
+      LogExecutionRequest("request", isBuy, lots, sl, tp, magicOffset, fullComment, slPrice, tpPrice);
 
       if(isBuy)
          result = g_trade.Buy(lots, g_symbol, 0.0, slPrice, tpPrice, fullComment);
@@ -1557,8 +1633,7 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
 
       if(result && g_trade.ResultRetcode() == TRADE_RETCODE_DONE)
       {
-         Print("Trade OK: ", (isBuy?"BUY":"SELL"), " ", lots, " @ ", price,
-               " SL=", slPrice, " TP=", tpPrice, " Magic=", InpMagicBase + magicOffset);
+         LogExecutionRequest("filled", isBuy, lots, sl, tp, magicOffset, fullComment, slPrice, tpPrice);
          g_lastTradeTime = TimeCurrent();
          g_lastTradeBarTime = iTime(g_symbol, g_timeframe, 0);
          return true;
@@ -1568,7 +1643,7 @@ bool ExecuteTradeWithRetry(bool isBuy, double lots, double sl, double tp, long m
          long spreadPoints = SymbolInfoInteger(g_symbol, SYMBOL_SPREAD);
          double reqSlDistPips = (slPrice > 0) ? PriceToPips(MathAbs(price - slPrice)) : 0.0;
          double reqTpDistPips = (tpPrice > 0) ? PriceToPips(MathAbs(price - tpPrice)) : 0.0;
-         Print("Trade attempt ", attempt+1, " failed: ", g_trade.ResultRetcodeDescription(),
+         Print("Trade attempt ", attempt+1, "/", effectiveRetries, " failed: ", g_trade.ResultRetcodeDescription(),
                " Code: ", g_trade.ResultRetcode(),
                " symbol=", g_symbol,
                " spreadPts=", spreadPoints,
@@ -1601,7 +1676,7 @@ bool PlacePendingOrder(bool isBuyDirection, bool isLimit, double price, double l
    if(tpPips > 0)
       tpPrice = isBuyDirection ? NormalizePrice(price + PipsToPrice(tpPips)) : NormalizePrice(price - PipsToPrice(tpPips));
 
-   string fullComment = InpTradeCommentPrefix + "_" + comment;
+   string fullComment = ComposeTradeComment(comment, comment);
 
    ENUM_ORDER_TYPE orderType;
    if(isBuyDirection)
@@ -1639,6 +1714,8 @@ void PlaceOriginalEntries(int signal)
    if(signal == 0) return;
    if(!InpSys1_EnableOriginal && InpEntrySystemMode == ENTRY_System1_SingleReversal) return;
 
+   bool strictExec = IsStrictOriginalExecutionMode();
+
    // Check position limits
    int totalPos = CountAllEAPositions();
    if(totalPos >= InpMaxPositionsTotal) return;
@@ -1646,8 +1723,8 @@ void PlaceOriginalEntries(int signal)
    int sys1Pos = CountPositions(MAGIC_ORIGINAL_SINGLE_BUY) + CountPositions(MAGIC_ORIGINAL_SINGLE_SELL);
    if(sys1Pos >= InpSys1_MaxPositions) return;
 
-   // Check min seconds between entries
-   if(TimeCurrent() - g_lastTradeTime < g_effSys1MinSecBetween) return;
+   // Check min seconds between entries (disabled in strict original execution mode)
+   if(!strictExec && TimeCurrent() - g_lastTradeTime < g_effSys1MinSecBetween) return;
 
    // Check opposite direction
    if(!InpAllowOppositeDirection)
@@ -1659,7 +1736,9 @@ void PlaceOriginalEntries(int signal)
    double lots = CalculateLotSize(InpOriginal_SL_Pips);
    bool isBuy = (signal > 0);
    long magicOff = isBuy ? MAGIC_ORIGINAL_SINGLE_BUY : MAGIC_ORIGINAL_SINGLE_SELL;
-   string tag = isBuy ? "OrigBuy" : "OrigSell";
+   string defaultTag = isBuy ? "OrigBuy" : "OrigSell";
+   string compatTag = isBuy ? "17" : "18";
+   string tag = IsOriginalCompatibilityMode() ? compatTag : defaultTag;
 
    if(ExecuteTradeWithRetry(isBuy, lots, InpOriginal_SL_Pips, InpOriginal_TP_Pips, magicOff, tag))
       g_state = STATE_OriginalPositionsRunning;
@@ -2679,29 +2758,64 @@ void OnTick()
       }
    }
 
-   // One trade per bar check (only blocks after an actual trade this bar)
    datetime barTime = iTime(g_symbol, g_timeframe, 0);
-   if(InpOneTradePerBar && g_state == STATE_Idle && g_lastTradeBarTime == barTime)
+   bool isNewBar = (barTime != g_lastBarTime);
+   g_lastBarTime = barTime;
+
+   bool strictExec = IsStrictOriginalExecutionMode();
+
+   // One trade per bar check (disabled in strict original execution mode)
+   if(!strictExec && InpOneTradePerBar && g_state == STATE_Idle && g_lastTradeBarTime == barTime)
    {
       ManageExits();
       return;
    }
-   bool isNewBar = (barTime != g_lastBarTime);
-   g_lastBarTime = barTime;
 
    EvaluateTickFrequencyGuard(isNewBar);
 
-   // Update detectors once/tick, then evaluate only in entry states
-   UpdateSignalEventState();
-
-   bool isSignalEvaluationActive = (g_state == STATE_Idle || g_state == STATE_OriginalSignalTriggered ||
-                                   (InpUseOriginalSignalProfile && g_state == STATE_ReversalEligibleWindow));
    int signal = 0;
-   if(isSignalEvaluationActive)
-      signal = DetectSignal();
+   bool isSignalEvaluationActive = true;
 
-   // Run state machine
-   RunStateMachine(signal);
+   if(strictExec)
+   {
+      bool buySignal = (DetectTimeBombUp() && DetectImpulseUp());
+      bool sellSignal = (DetectTimeBombDown() && DetectImpulseDown());
+
+      if(buySignal)
+      {
+         signal = +1;
+         PlaceOriginalEntries(+1);
+      }
+
+      if(sellSignal)
+      {
+         signal = -1;
+         PlaceOriginalEntries(-1);
+      }
+   }
+   else
+   {
+      bool strictSignal = IsStrictOriginalSignalMode();
+      if(!strictSignal)
+         UpdateSignalEventState();
+
+      isSignalEvaluationActive = (g_state == STATE_Idle || g_state == STATE_OriginalSignalTriggered ||
+                                  (InpUseOriginalSignalProfile && g_state == STATE_ReversalEligibleWindow));
+      if(isSignalEvaluationActive)
+      {
+         if(strictSignal)
+            signal = DetectSignalStrictOriginalChain();
+         else
+            signal = DetectSignal();
+      }
+      else
+      {
+         signal = 0;
+      }
+
+      // Run state machine
+      RunStateMachine(signal);
+   }
 
    // Diagnostics for long no-signal runs
    if(isNewBar)
