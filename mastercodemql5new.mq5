@@ -361,7 +361,6 @@ bool           g_tbHistoryKnownUp = false;
 bool           g_tbHistoryKnownDn = false;
 datetime       g_eaInitTime = 0;
 datetime       g_eaInitTickTime = 0;
-
 // Effective parameters (can be profile-adjusted)
 double         g_effTimeBombUpPips = 0.0;
 double         g_effTimeBombUpSeconds = 0.0;
@@ -377,7 +376,6 @@ bool           g_effRequireTBHistoryBeforeFallback = true;
 int            g_effCooldownSecondsAfterTrade = 0;
 int            g_effSys1MinSecBetween = 0;
 bool           g_tickFreqBarFallbackActive = false;
-int            g_bypassLastDirection = -1;
 int            g_conflictsTotal = 0;
 int            g_conflictsDiscardedBuy = 0;
 int            g_conflictsDiscardedSell = 0;
@@ -419,7 +417,7 @@ double EstimateAtrPips(int lookbackBars);
 void LogSignalConfigRiskAtStartup();
 void EvaluateTickFrequencyGuard(bool isNewBar);
 void ResetGridActivationState(string reasonCode);
-bool RunBacktestBypassSystem(bool isNewBar);
+bool RunBacktestBypassSystem(bool isNewBar, int signal);
 
 bool ValidateInputs()
 {
@@ -2581,8 +2579,7 @@ void RunStateMachine(int signal)
       }
    }
 }
-
-bool RunBacktestBypassSystem(bool isNewBar)
+bool RunBacktestBypassSystem(bool isNewBar, int signal)
 {
    if(!InpEnableBacktestBypassSystem)
       return false;
@@ -2593,21 +2590,24 @@ bool RunBacktestBypassSystem(bool isNewBar)
    if(InpBypassMinSecBetween > 0 && (TimeCurrent() - g_lastTradeTime) < InpBypassMinSecBetween)
       return true;
 
-   int signal = +1;
-   if(InpBypassDirection == BYPASS_BuyOnly)
-      signal = +1;
-   else if(InpBypassDirection == BYPASS_SellOnly)
-      signal = -1;
+   int entrySignal = signal;
+   if(InpBypassDirection == BYPASS_BuyOnly && entrySignal < 0)
+      entrySignal = 0;
+   else if(InpBypassDirection == BYPASS_SellOnly && entrySignal > 0)
+      entrySignal = 0;
    else if(InpBypassDirection == BYPASS_Candle1)
    {
       double c1 = iClose(g_symbol, g_timeframe, 1);
       double o1 = iOpen(g_symbol, g_timeframe, 1);
-      signal = (c1 >= o1) ? +1 : -1;
+      int candleSignal = (c1 >= o1) ? +1 : -1;
+      if(entrySignal != candleSignal)
+         entrySignal = 0;
    }
-   else
+
+   if(entrySignal == 0)
    {
-      g_bypassLastDirection = -g_bypassLastDirection;
-      signal = (g_bypassLastDirection == 0) ? +1 : g_bypassLastDirection;
+      Print("Backtest bypass: no qualified entry signal this tick.");
+      return true;
    }
 
    if(InpBypassCloseBeforeEntry)
@@ -2620,7 +2620,7 @@ bool RunBacktestBypassSystem(bool isNewBar)
       return true;
    }
 
-   bool isBuy = (signal > 0);
+   bool isBuy = (entrySignal > 0);
    long magicOff = isBuy ? MAGIC_ORIGINAL_SINGLE_BUY : MAGIC_ORIGINAL_SINGLE_SELL;
    string tag = isBuy ? "BypassBuy" : "BypassSell";
 
@@ -2643,10 +2643,13 @@ void OnTick()
    if(InpEnableBacktestBypassSystem)
    {
       g_lastBarTime = bypassBarTime;
-      RunBacktestBypassSystem(bypassIsNewBar);
+      UpdateSignalEventState();
+      int bypassSignal = DetectSignal();
+      RunBacktestBypassSystem(bypassIsNewBar, bypassSignal);
       ManageExits();
       return;
    }
+
 
    // Pre-checks
    if(IsDailyLossLimitHit())
